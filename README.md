@@ -1,10 +1,9 @@
 # Comet 
  
 Now with Batch Merging, tested with screenshots taken in:
-
-Luma v13.3.3
-Luma v13.4
-Nexus3DS
+- Luma v13.3.3
+- Luma v13.4
+- Nexus3DS
 
 ![Comet banner](meta/banner.png)
 
