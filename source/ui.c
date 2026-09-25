@@ -33,6 +33,7 @@ typedef enum {
     APP_CONVERTING,
     APP_RESULT,
     APP_BATCH_CONVERTING,
+    APP_BATCH_MERGING,
     APP_BATCH_RESULT,         // now doubles as the "copied -- delete originals?" prompt
     APP_BATCH_DELETE_CONFIRM, // standalone batch delete (X), no copy involved
     APP_BATCH_DELETING,       // shared by both the standalone and post-copy delete paths
@@ -353,7 +354,8 @@ static bool s_batchMode = false;
 static bool s_batchSelected[MAX_PAIRS];
 static int  s_batchTotal = 0;
 static int  s_batchSucceeded = 0;
-static int  s_batchIndex = 0;
+static int s_batchSkipped = 0;
+static int s_batchIndex = 0;
 
 static int s_flashFrames = 0;
 
@@ -554,6 +556,7 @@ static bool state_has_popup(AppState st)
     case APP_DETAIL_DELETE_CONFIRM:
     case APP_DETAIL_DELETING:
     case APP_BATCH_CONVERTING:
+    case APP_BATCH_MERGING:
     case APP_BATCH_RESULT:
     case APP_BATCH_DELETE_CONFIRM:
     case APP_BATCH_DELETING:
@@ -1726,6 +1729,70 @@ static void draw_popup_button(int index, int count, const char *label, bool sele
     draw_centered_text(x, y, w, h, TEXT_12, COLOR_TEXT, label);
 }
 
+static bool popup_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int popup_wrap_text(const char *text, char lines[][128], int maxLines)
+{
+    int count = 0;
+    const char *p = text;
+
+    while (*p && count < maxLines) {
+        while (*p && popup_space(*p)) p++;
+        if (!*p) break;
+
+        char current[128] = "";
+        while (*p && *p != '\n') {
+            while (*p && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+            if (!*p || *p == '\n') break;
+
+            char word[128];
+            size_t wordLen = 0;
+            while (p[wordLen] && !popup_space(p[wordLen]) && wordLen < sizeof(word) - 1) {
+                word[wordLen] = p[wordLen];
+                wordLen++;
+            }
+            word[wordLen] = '\0';
+            p += wordLen;
+
+            char candidate[128];
+            if (current[0]) {
+                size_t currentLen = strlen(current);
+                size_t wordLenForCandidate = strlen(word);
+                if (currentLen >= sizeof(candidate) - 1) currentLen = sizeof(candidate) - 1;
+                size_t room = sizeof(candidate) - 1 - currentLen;
+                if (room > 0) {
+                    candidate[currentLen++] = ' ';
+                    room--;
+                }
+                if (wordLenForCandidate > room) wordLenForCandidate = room;
+                memcpy(candidate + currentLen, word, wordLenForCandidate);
+                candidate[currentLen + wordLenForCandidate] = '\0';
+            } else {
+                snprintf(candidate, sizeof(candidate), "%s", word);
+            }
+
+            if (current[0] && measure_text(TEXT_12, candidate) > POPUP_W - 12.0f) {
+                snprintf(lines[count++], 128, "%s", current);
+                if (count >= maxLines) return count;
+                snprintf(current, sizeof(current), "%s", word);
+            } else {
+                snprintf(current, sizeof(current), "%s", candidate);
+            }
+        }
+
+        if (current[0]) {
+            snprintf(lines[count], 128, "%s", current);
+            count++;
+        }
+        if (*p == '\n') p++;
+    }
+
+    return count;
+}
+
 // Draws the message block starting at an explicit Y, for layouts where
 // centring in the remaining space isn't what's wanted.
 static void draw_popup_lines_at(const char *l1, const char *l2, float top)
@@ -1746,17 +1813,20 @@ static void draw_popup_lines(const char *l1, const char *l2, const char *l3, boo
 {
     float top = popup_y();
     float areaH = POPUP_H - (reserveButtons ? POPUP_BTN_H : 0.0f);
-    int n = (l1 ? 1 : 0) + (l2 ? 1 : 0) + (l3 ? 1 : 0);
+    const char *input[3] = { l1, l2, l3 };
+    char lines[5][128];
+    int n = 0;
+    for (int i = 0; i < 3 && n < 5; i++) {
+        if (input[i]) {
+            n += popup_wrap_text(input[i], &lines[n], 5 - n);
+        }
+    }
     if (n == 0) return;
-    const float lineH = 18.0f;
+    const float lineH = n > 4 ? 14.0f : 18.0f;
     float blockTop = top + (areaH - n * lineH) / 2.0f;
-    const char *lines[3] = { l1, l2, l3 };
-    int row = 0;
-    for (int i = 0; i < 3; i++) {
-        if (!lines[i]) continue;
-        draw_centered_text(popup_x(), blockTop + row * lineH, POPUP_W, lineH,
+    for (int i = 0; i < n; i++) {
+        draw_centered_text(popup_x(), blockTop + i * lineH, POPUP_W, lineH,
                             TEXT_12, COLOR_POPUP_TEXT, lines[i]);
-        row++;
     }
 }
 
@@ -2442,24 +2512,22 @@ static bool item_is_widescreen(int idx)
 // (used everywhere this gets parsed) only reads the leading date/time
 // and ignores anything after, the merged entry still sorts, filters,
 // and displays by its true original date.
-static void do_merge_top_bottom(void)
+static bool merge_pair_to_bmp(const ScreenshotPair *p, char *outPath, size_t outPathSize,
+                              char *err, size_t errSize)
 {
-    int idx = (s_selected >= 0 && s_selected < s_visibleCount)
-                ? s_visibleIndices[s_selected] : -1;
-    if (s_dsMode || idx < 0 || idx >= s_pairCount) { s_state = APP_DETAIL; return; }
-
-    ScreenshotPair *p = &s_pairs[idx];
-    char err[128] = {0};
     RGBImage top, bot;
     bool haveTop = false, haveBot = false, ok = false;
-    char outPath[320] = "";
 
-    haveTop = bmp_load(p->topPath, &top, err, sizeof(err));
-    if (haveTop && p->botPath[0]) {
-        haveBot = bmp_load(p->botPath, &bot, err, sizeof(err));
+    if (!p || p->isCombined || !p->topPath[0] || !p->botPath[0]) {
+        snprintf(err, errSize, "No bottom screen capture.");
+        return false;
     }
 
-    if (haveTop) {
+    outPath[0] = '\0';
+    haveTop = bmp_load(p->topPath, &top, err, errSize);
+    if (haveTop) haveBot = bmp_load(p->botPath, &bot, err, errSize);
+
+    if (haveTop && haveBot) {
         RGBImage merged;
         merged.width = 400;
         merged.height = 480;
@@ -2495,23 +2563,36 @@ static void do_merge_top_bottom(void)
             const char *lastSlash = strrchr(p->topPath, '/');
             if (lastSlash) {
                 int dirLen = (int)(lastSlash - p->topPath);
-                snprintf(outPath, sizeof(outPath), "%.*s/%s_cmb.bmp",
+                snprintf(outPath, outPathSize, "%.*s/%s_cmb.bmp",
                          dirLen, p->topPath, p->timestamp);
             } else {
                 // topPath is always an absolute path in practice, but
                 // fall back to the known root rather than fail outright.
-                snprintf(outPath, sizeof(outPath), "%s%s/%s_cmb.bmp",
+                snprintf(outPath, outPathSize, "%s%s/%s_cmb.bmp",
                          SD_ROOT, SCREENSHOTS_DIR, p->timestamp);
             }
-            ok = bmp_write(outPath, &merged, err, sizeof(err));
+            ok = bmp_write(outPath, &merged, err, errSize);
             free(merged.pixels);
         } else {
-            snprintf(err, sizeof(err), "Out of memory");
+            snprintf(err, errSize, "Out of memory");
         }
     }
 
     if (haveTop) bmp_free(&top);
     if (haveBot) bmp_free(&bot);
+    return ok;
+}
+
+static void do_merge_top_bottom(void)
+{
+    int idx = (s_selected >= 0 && s_selected < s_visibleCount)
+                ? s_visibleIndices[s_selected] : -1;
+    if (s_dsMode || idx < 0 || idx >= s_pairCount) { s_state = APP_DETAIL; return; }
+
+    char err[128] = {0};
+    char outPath[320] = "";
+    bool ok = merge_pair_to_bmp(&s_pairs[idx], outPath, sizeof(outPath),
+                                err, sizeof(err));
 
     if (ok) {
         int n = fs_scan_screenshot_pairs(s_pairs, MAX_PAIRS);
@@ -2635,6 +2716,81 @@ static void begin_batch_convert(void)
     s_batchSucceeded = 0;
     s_batchIndex = 0;
     op_enter(APP_BATCH_CONVERTING);
+}
+
+static bool batch_item_mergeable(int idx)
+{
+    return !s_dsMode && idx >= 0 && idx < s_pairCount &&
+           !s_pairs[idx].isCombined && s_pairs[idx].botPath[0];
+}
+
+static void begin_batch_merge(void)
+{
+    s_batchTotal = 0;
+    s_batchSkipped = 0;
+    int totalItems = item_count();
+    for (int i = 0; i < totalItems; i++) {
+        if (!s_batchSelected[i]) continue;
+        if (batch_item_mergeable(i)) s_batchTotal++;
+        else                        s_batchSkipped++;
+    }
+    if (s_batchTotal == 0) return;
+
+    s_batchSucceeded = 0;
+    s_batchIndex = 0;
+    op_enter(APP_BATCH_MERGING);
+}
+
+static void do_batch_merge_step(void)
+{
+    int total = item_count();
+    while (s_batchIndex < total &&
+           (!s_batchSelected[s_batchIndex] || !batch_item_mergeable(s_batchIndex))) {
+        s_batchIndex++;
+    }
+
+    if (s_batchIndex >= total) {
+        int skipped = s_batchSkipped;
+        s_lastSuccess = s_batchSucceeded > 0;
+        snprintf(s_lastMessage, sizeof(s_lastMessage), "%d screenshot%s merged.",
+                 s_batchSucceeded, s_batchSucceeded == 1 ? "" : "s");
+        if (skipped > 0) {
+            snprintf(s_lastOutputPath, sizeof(s_lastOutputPath),
+                     "%d skipped: already merged",
+                     skipped);
+        } else {
+            snprintf(s_lastOutputPath, sizeof(s_lastOutputPath),
+                     "Combined screenshots created.");
+        }
+
+        int n = fs_scan_screenshot_pairs(s_pairs, MAX_PAIRS);
+        s_pairCount = (n < 0) ? 0 : n;
+        free_all_thumbnails();
+        memset(s_thumbs, 0, sizeof(s_thumbs));
+        s_batchMode = false;
+        memset(s_batchSelected, 0, sizeof(s_batchSelected));
+        rebuild_visible_list();
+        free_preview_textures();
+        s_previewLoadedPairIndex = -1;
+        s_previewRequestedPairIndex = -1;
+
+        if (s_batchSucceeded > 0) {
+            audio_play(SFX_COPY);
+            s_thumbSfxMute = 45;
+        }
+        op_complete(APP_RESULT);
+        return;
+    }
+
+    char err[128] = {0};
+    char outPath[320] = "";
+    if (merge_pair_to_bmp(&s_pairs[s_batchIndex], outPath, sizeof(outPath),
+                          err, sizeof(err))) {
+        s_batchSucceeded++;
+    } else {
+        s_batchSkipped++;
+    }
+    s_batchIndex++;
 }
 
 static void do_batch_convert_step(void)
@@ -2930,6 +3086,7 @@ static void draw_top_screen(void)
         draw_easter_egg_eye(&s_easterEggTex[EASTER_EGG_DOGRIGHT]);
         return;
     case APP_BATCH_CONVERTING:
+    case APP_BATCH_MERGING:
     case APP_BATCH_RESULT:
     case APP_BATCH_DELETE_CONFIRM:
     case APP_BATCH_DELETING:
@@ -2977,6 +3134,8 @@ static void draw_top_screen(void)
 // Captured at draw time rather than hardcoded, and cleared on any
 // screen that doesn't show it.
 static float s_modeToggleX = 0.0f, s_modeToggleW = 0.0f;
+static float s_batchMergeX = 0.0f, s_batchMergeW = 0.0f;
+static bool s_batchMergeVisible = false;
 
 // Set in ui_frame (where touch coordinates are actually accessible),
 // read in draw_bottom_screen's peekingBottomCapture check.
@@ -3058,6 +3217,23 @@ static void draw_header_full(const char *leftLabel, const char *rightLabel,
     }
 
     draw_frame_rule(HEADER_H);
+}
+
+static void draw_batch_merge_hint(bool enabled)
+{
+    s_batchMergeVisible = true;
+    const float gap = 5.0f;
+    float iw = icon_width(ICON_BTN_R);
+    float labelW = measure_text(TEXT_12, "Merge");
+    float total = iw + gap + labelW;
+    const float rightEdge = 304.0f;
+    float x = rightEdge - total;
+    u32 textColor = enabled ? COLOR_TEXT : C2D_Color32(0xFD, 0xFD, 0xFD, 0x80);
+
+    s_batchMergeX = x - 4.0f;
+    s_batchMergeW = total + 8.0f;
+    draw_icon_tinted(ICON_BTN_R, x, (HEADER_H - icon_height(ICON_BTN_R)) / 2.0f, !enabled);
+    draw_text_vcenter(x + iw + gap, 0, HEADER_H, TEXT_12, textColor, "Merge");
 }
 
 static void draw_header(const char *leftLabel, const char *rightLabel)
@@ -3180,7 +3356,19 @@ static void draw_grid(void)
     // room to spare for a second header line.
     if (s_batchMode) {
         draw_header("Batch Select", NULL);
+        s_batchMergeVisible = false;
+        if (!s_dsMode) {
+            bool anyMergeable = false;
+            for (int i = 0; i < item_count(); i++) {
+                if (s_batchSelected[i] && batch_item_mergeable(i)) {
+                    anyMergeable = true;
+                    break;
+                }
+            }
+            draw_batch_merge_hint(anyMergeable);
+        }
     } else {
+        s_batchMergeVisible = false;
         // The mode toggle only advertises itself when there's actually
         // something on the other side, and only on the album screen.
         // The SD Card tab supports filtering, so it shows the same
@@ -3336,7 +3524,8 @@ static int detail_menu_item_count(void)
     // s_previewLoadedPairIndex, not s_selected-derived -- see
     // draw_detail_menu for why.
     int idx = s_previewLoadedPairIndex;
-    bool canMerge = idx >= 0 && idx < s_pairCount && s_pairs[idx].botPath[0];
+    bool canMerge = idx >= 0 && idx < s_pairCount &&
+                    !s_pairs[idx].isCombined && s_pairs[idx].botPath[0];
     return canMerge ? 3 : 2; // Copy / [Merge] / Delete
 }
 
@@ -3830,6 +4019,11 @@ static void draw_bottom_screen(void)
         draw_popup("Copying...", "Don't remove SD card!", true, false);
         break;
 
+    case APP_BATCH_MERGING:
+        draw_grid();
+        draw_popup("Merging...", "Don't remove SD card!", true, false);
+        break;
+
     case APP_BATCH_RESULT:
         draw_grid();
         draw_confirm_popup(s_lastMessage, s_lastOutputPath, "Back", "Delete", s_confirmSelection);
@@ -4030,6 +4224,21 @@ bool ui_frame(void)
         }
     }
 
+    if (tapped && s_state == APP_BROWSE && s_batchMode && s_batchMergeVisible &&
+        point_in_rect(touch.px, touch.py, s_batchMergeX, 0, s_batchMergeW, HEADER_H)) {
+        bool anyMergeable = false;
+        for (int i = 0; i < item_count(); i++) {
+            if (s_batchSelected[i] && batch_item_mergeable(i)) {
+                anyMergeable = true;
+                break;
+            }
+        }
+        if (anyMergeable) {
+            kDown |= KEY_R;
+            tapped = false;
+        }
+    }
+
     int  batchSelSnapshot = 0;
     for (int i = 0; i < MAX_PAIRS; i++) if (s_batchSelected[i]) batchSelSnapshot += i + 1;
     int  selectedBefore   = s_selected;
@@ -4112,10 +4321,15 @@ bool ui_frame(void)
                 memset(s_batchSelected, 0, sizeof(s_batchSelected));
             }
             bool anySel = false;
+            bool anyMergeable = false;
             int selTotal = item_count();
-            for (int i = 0; i < selTotal; i++) if (s_batchSelected[i]) { anySel = true; break; }
+            for (int i = 0; i < selTotal; i++) {
+                if (s_batchSelected[i]) anySel = true;
+                if (s_batchSelected[i] && batch_item_mergeable(i)) anyMergeable = true;
+            }
             if ((kDown & KEY_X) && anySel) begin_batch_delete();
             if ((kDown & KEY_L) && anySel) begin_batch_convert();
+            if ((kDown & KEY_R) && anyMergeable) begin_batch_merge();
         } else {
             if ((kDown & KEY_A) && current_preview_ready()) enter_detail_view();
             if (tapped) {
@@ -4549,6 +4763,12 @@ bool ui_frame(void)
     case APP_BATCH_CONVERTING:
         s_opFrames++;
         if (!s_opDone) do_batch_convert_step();
+        else if (s_opFrames >= OP_MIN_FRAMES) s_state = s_opNextState;
+        break;
+
+    case APP_BATCH_MERGING:
+        s_opFrames++;
+        if (!s_opDone) do_batch_merge_step();
         else if (s_opFrames >= OP_MIN_FRAMES) s_state = s_opNextState;
         break;
 
