@@ -5,15 +5,14 @@
 Install [devkitPro](https://devkitpro.org/wiki/Getting_Started) with
 the 3DS development packages (`3ds-dev` package group via `dkp-pacman`).
 
-## 2. Add stb_image_write.h
+## 2. Add image headers
 
 ```
 curl -o source/stb_image_write.h https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h
 ```
 
-(This is the one file not checked into the repo — its license asks
-that it be downloaded fresh from the source rather than redistributed,
-unlike the fonts/banner/icons, which are all baked in.)
+This single-header library is downloaded fresh from the source rather
+than redistributed and is used for exported JPEGs.
 
 ## 3. Build
 

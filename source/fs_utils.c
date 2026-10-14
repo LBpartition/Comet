@@ -186,6 +186,11 @@ int fs_scan_screenshot_pairs(ScreenshotPair *out, int max)
         memcpy(subName, subDirs[i], MAX_ENTRY_NAME);
         subName[MAX_ENTRY_NAME - 1] = '\0';
 
+        // The extracted DS library is reserved for DS mode. Other
+        // subdirectories remain supported for Nexus3DS date folders.
+        if (strcmp(subName, DS_SCREENSHOTS_SUBDIR) == 0 ||
+            strcmp(subName, GBA_SCREENSHOTS_SUBDIR) == 0) continue;
+
         char subPath[600];
         snprintf(subPath, sizeof(subPath), "%s/%s", rootPath, subName);
 

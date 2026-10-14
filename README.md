@@ -1,9 +1,26 @@
-# Comet 
- 
-Now with Batch Merging, tested with screenshots taken in:
-- Luma v13.3.3
-- Luma v13.4
-- Nexus3DS
+# Comet (FORK)
+
+New features and changes:
+
+* Added: Batch Merging, tested with screenshots taken in:
+   - Luma v13.3.3
+   - Luma v13.4
+   - Nexus3DS 
+
+* Added: GBA Mode - View and manage Open_AGB_Firm screenshots
+   - Use L / R to switch between 3DS / DS / GBA modes
+   - Option to move GBA screenshots from `/3ds/open_agb_firm/screenshots/` to `/luma/screenshots/GBA Screenshots/`
+
+* Changes: DS Mode:
+   - DS .tar screenshots are extracted to `/luma/screenshots/GBA Screenshots/`
+   - Added functional filters to NDS Mode's Extracted section
+
+* Changes: 3DS Mode: 
+   - Hold X to peek at images directly from the thumbnail selection screen
+
+* Added Favorites system - Press A on any screenshot and add it to your favorites
+   - Favorited screenshots use the Comet Star icon as a thumbnail badge
+   - Added a filter to only show favorited images.
 
 ![Comet banner](meta/banner.png)
 
@@ -31,9 +48,16 @@ with the Luma/Rosalina naming theme.
 - **Copy to the 3DS Camera album:** writes proper `.MPO` files for 3D
   pairs (with the MPF/EXIF tags the Camera app actually checks for)
   and plain `.JPG` for 2D screenshots, individually or in batch
-- **Delete**, individually or in batch, always with a confirmation step
-- **Filter** by All / 3D Only / 2D Only, or drill into a specific
-  Year → Month → Day
+- Batch **Copy to Album** and **Merge** show a Cancel/action
+  confirmation before processing starts
+- Thumbnail badges show Favorites at top-right, 3D at top-left,
+  Peekable lower captures at bottom-right, and DS tar/movable GBA
+  sources at bottom-left
+- **Delete**, individually or in batch, always with a confirmation step;
+  favorited screenshots are protected and skipped when mixed with
+  non-favorited batch selections
+- **Filter** by All / Favorites, or drill into a specific Year → Month
+  → Day; 3DS Mode also offers Merged / 3D Only / 2D Only
 - Peek at Luma's bottom-screen capture alongside any screenshot
 - **DS mode:** press L+R to switch to browsing DS screenshots taken
   with nds-bootstrap/TWiLightMenu++. Reads `screenshots.tar` directly,

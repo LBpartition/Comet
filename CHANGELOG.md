@@ -93,6 +93,16 @@ headline addition is full DS screenshot support.
 
 ## DS Mode
 
+### GBA Mode
+
+GBA Mode browses single-screen hardware-frame BMP dumps created by
+Open_AGB_Firm in both `sdmc:/3ds/open_agb_firm/screenshots/` and
+`sdmc:/luma/screenshots/GBA Screenshots/`. The latter is Comet's preferred
+destination; legacy captures can be moved there from the More menu or with
+GBA batch Move. The mode uses the same copy, delete, filtering, and batch
+controls as 3DS Mode, without the top/bottom merge action. L+R now cycles
+through 3DS, DS, and GBA modes.
+
 A second library alongside 3DS screenshots, toggled with **L+R** from
 the main grid. Browses, filters, previews (in real stereo where
 applicable — DS obviously isn't 3D, so this just means the native
@@ -107,7 +117,7 @@ nds-bootstrap keeps its screenshots in a single 50-slot
 directly — no manual extraction needed first:
 
 - **Two tabs**: `nds-bootstrap` (still in the tar) and `SD Card`
-  (already extracted to `sd:/3ds/Comet/ds_screenshots/`). Switch with
+  (already extracted to `sd:/luma/screenshots/DS Screenshots/`). Switch with
   a single L or R press, or by tapping a tab.
 - Screenshots in the tar can be **viewed, filtered, copied to the
   Album, and exported individually or in bulk** without ever leaving

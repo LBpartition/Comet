@@ -2,6 +2,7 @@
 
 typedef enum {
     ICON_COMET,
+    ICON_FAVES,
     ICON_BADGE_3D,
     ICON_BADGE_2D,
     ICON_BTN_A,
@@ -12,11 +13,11 @@ typedef enum {
     ICON_BTN_L,
     ICON_BTN_SELECT,
     ICON_BTN_START,
-    ICON_BADGE_DS_TAR,
+    ICON_BADGE_DS_TAR_GBA_MOVEABLE,
     ICON_BADGE_DS_EXTRACTED,
     ICON_TAB_L,
     ICON_TAB_R,
-    ICON_BADGE_MERGED,
+    ICON_BADGE_PEEKABLE,
     ICON_COUNT,
 } IconId;
 

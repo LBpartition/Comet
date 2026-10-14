@@ -14,6 +14,17 @@
 // Folder where Luma3DS Rosalina saves raw screenshots
 #define SCREENSHOTS_DIR       "/luma/screenshots"
 
+// Comet's extracted Nintendo DS screenshots live under the Luma screenshots
+// root, but remain separate from normal 3DS screenshot scanning.
+#define DS_SCREENSHOTS_SUBDIR "DS Screenshots"
+#define GBA_SCREENSHOTS_SUBDIR "GBA Screenshots"
+
+// Folders where Open_AGB_Firm saves hardware-frame screenshot dumps.
+// The legacy folder remains supported; the Luma folder is Comet's
+// preferred destination for moved captures.
+#define GBA_SCREENSHOTS_DIR        "/3ds/open_agb_firm/screenshots"
+#define GBA_SCREENSHOTS_LUMA_DIR   SCREENSHOTS_DIR "/" GBA_SCREENSHOTS_SUBDIR
+
 // Where Comet drops converted files if the user doesn't want them
 // injected straight into the 3DS Camera album
 #define FALLBACK_OUTPUT_DIR   "/luma/screenshots/mpo"

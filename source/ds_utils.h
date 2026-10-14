@@ -8,12 +8,12 @@
 // BMP signature. (Verified against a real screenshots.tar: 50 entries,
 // every one 98374 bytes, unused ones entirely 0x00.)
 #define DS_TAR_PATH        "/_nds/nds-bootstrap/screenshots.tar"
-#define DS_SCREENSHOTS_DIR "/3ds/Comet/ds_screenshots"
+#define DS_SCREENSHOTS_DIR SCREENSHOTS_DIR "/" DS_SCREENSHOTS_SUBDIR
 
 #define MAX_DS_SHOTS 256
 
 typedef struct {
-    char path[256];       // .../ds_screenshots/{stamp}_slotNN.bmp
+    char path[256];       // .../DS Screenshots/{stamp}_slotNN.bmp
     char timestamp[32];   // "YYYY-MM-DD_HH-MM-SS" -- when Comet IMPORTED it.
                           // nds-bootstrap records no capture time anywhere
                           // (every tar entry carries the same hardcoded

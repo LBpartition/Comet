@@ -53,13 +53,45 @@ Nintendo's own Switch Album app.
 
 ## Date-subfolder screenshots (Nexus3DS "save in date folders")
 
+## Open_AGB_Firm screenshots (GBA Mode)
+
+Open_AGB_Firm writes single-screen hardware-frame dumps to
+`sdmc:/3ds/open_agb_firm/screenshots/` using the filename format
+`YYYY_MM_DD_HH_MM_SS.bmp`. GBA Mode scans that legacy directory and
+Comet's preferred `sdmc:/luma/screenshots/GBA Screenshots/` directory,
+treating each BMP as an independent 2D screenshot. Legacy captures can
+be moved to the preferred directory; files already there do not show a
+second Move action, and legacy captures display a small archive-style
+badge. GBA mode therefore does not offer 3DS top/bottom merge
+operations.
+
+## Favorites
+
+The More/Detail view can add or remove Favorites for 3DS screenshots,
+GBA screenshots, and extracted DS screenshots. Screenshots still inside
+nds-bootstrap's `screenshots.tar` are intentionally excluded. Favorite
+paths are persisted in `sdmc:/3ds/Comet/favorites.txt`, sorted before
+non-favorites, and marked with the Comet favorite badge in the
+thumbnail's top-left corner. The favorite badge replaces the normal
+source/type badge for that thumbnail.
+
+Favorited screenshots are protected from deletion in 3DS, DS Extracted,
+and GBA modes. The individual More/Detail menu omits Delete for a
+favorite. Batch Delete remains available when a mixed selection contains
+deletable screenshots, but skips the selected favorites; a selection
+containing only favorites has no deletable action. The Screenshots.tar
+tab has no Favorites support, so its existing delete behavior is
+unchanged.
+
 `fs_scan_screenshot_pairs` scans the root screenshots directory plus
 one level of subdirectories -- Nexus3DS's optional date-folder layout
 (`luma/screenshots/2026-08-27/`) puts each day's captures in their own
 folder there. Subfolder names aren't validated as looking like a date
-at all; any subdirectory found gets scanned the same way the root
-does, so this doesn't depend on matching one exact naming convention
-and stays correct if a different fork names its folders differently.
+at all; any subdirectory found gets scanned the same way the root does,
+except Comet's reserved `luma/screenshots/DS Screenshots/` directory,
+which is scanned only by DS mode. This doesn't depend on matching one
+exact date naming scheme and stays correct if a different fork names
+its folders differently.
 Only one level deep -- there's no legitimate reason for a screenshot
 to be nested further, and bounding the recursion keeps the scan cost
 predictable.
@@ -227,8 +259,12 @@ demonstrating the distortion this fixes, not just inferring it existed).
 existing `memset`). Previously a combined screenshot was
 indistinguishable from an ordinary flat one at the struct level --
 both had `has3D=false` -- so it showed the generic 2D badge. The grid
-now checks `isCombined` before falling back to the 3D/2D check, and
-shows a dedicated badge instead. Verified with a real compiled scan
+now checks `isCombined` before the 3D/Peek badge logic, so merged
+screenshots show neither badge. The former Merged badge is now used to
+indicate a separate peekable bottom-screen capture, while the generic
+2D badge is no longer displayed. Thumbnail placement is top-right for
+Favorites, top-left for 3D, bottom-right for Peekable, and bottom-left
+for DS tar/movable GBA sources. Verified with a real compiled scan
 against a directory containing both a regular screenshot and a
 `_cmb.bmp` one side by side: the flag came back false and true
 respectively, as expected.
@@ -294,14 +330,14 @@ The background loader has a single pending-result slot, and
 what the caller asked for. That was safe while only one thing polled
 it, but enabling live preview updates in `APP_DETAIL` (needed so
 Left/Right navigation updates the top screen) added a second consumer
-alongside the R-held bottom-screen capture. Whichever polled first
+alongside the X-held bottom-screen capture. Whichever polled first
 each frame would destroy the other's completed job, leaving that
 consumer waiting on a result that no longer existed: a spinner that
 never resolves.
 
 Symptoms matched exactly: intermittent-but-reproducible-per-screenshot
 (it depends on which job finishes first), affecting both the preview
-and the R-held bottom capture, and **not** affecting DS mode at all --
+and the X-held bottom capture, and **not** affecting DS mode at all --
 `request_bottom_capture()` is only called when `!s_dsMode`, so DS mode
 only ever has one consumer and no contention.
 
@@ -436,7 +472,7 @@ trailing text. Only the source field itself needed to grow.
 
 DS mode browses two separate libraries via a tab bar: screenshots
 still sitting in nds-bootstrap's `screenshots.tar`, and ones already
-extracted to `sd:/3ds/Comet/ds_screenshots/`. They get entirely
+extracted to `sd:/luma/screenshots/DS Screenshots/`. They get entirely
 separate backing arrays -- tar items share one file at different byte
 offsets, extracted ones are ordinary standalone files -- so a single
 list carrying both shapes would have been messier than two.
@@ -540,11 +576,17 @@ share this code path and `GRID_COLS`.
 
 ## Filter behaviour
 
+- Favorites is available in 3DS, DS Extracted, and GBA modes and
+  matches the persistent path-based Favorites list. The DS
+  Screenshots.tar tab has no filter menu because it uses its own
+  archive and batch controls. Merged, 3D Only, and 2D Only are
+  available only in 3DS Mode; Merged matches combined top/bottom
+  captures.
 - Every level of the date filter (Year, Month, Day) has an explicit
   "All" option. Year = All means no date narrowing at all, and hides
   the Month/Day rows entirely -- there's no year for them to narrow
-  within. This is also the only way to clear a filter in DS mode,
-  where By Date is the whole filter UI.
+  within. The shared date-picker flow is used by 3DS, DS Extracted,
+  and GBA.
 - Entering By Date defaults Year to the most recent available, but
   only when a date filter isn't already active -- otherwise picking
   "All" would get silently undone the next time the screen opened.
@@ -566,11 +608,13 @@ covered by the MIT grant:
 
 ## Hidden easter egg
 
-Triple-tap the header's Comet icon within 1 second, from the plain
-(non-batch) 3DS or DS grid, to reach a static thank-you screen with a
-stereo photo of the developer's dog. Same trigger tapped again from
-inside the screen exits, with the regular button sound instead of the
-jingle.
+Triple-tap the header's Comet icon within 1 second, from a plain
+(non-batch) grid, to reach a static thank-you screen. In 3DS and DS
+mode it shows a stereo photo of the developer's dog and the original
+thank-you text. In GBA mode it shows Barry's 400x240 photo on both top
+screens and the GBA-specific thank-you text on the bottom screen,
+without an avatar. The same trigger tapped again from inside the
+screen exits, with the regular button sound instead of the jingle.
 
 ### Tap timing
 
@@ -591,19 +635,16 @@ discrete taps unreliable.
 
 ### Compile-time embedded images
 
-The two dog photos and the pixel-art avatar are baked into
-`assets/easter_egg_data.c` via a build script
-(`bake_easter_egg.py`) using the exact same Morton/Z-order swizzle
-already verified correct for the icon pipeline -- just applied to
-much larger source images (400x240 stereo pair -> 512x256 textures
-each). Verified with real spot-checks (corners, edges, centre) between
-the baked data and the original source images before trusting it, not
-just "the script ran without error."
+The two dog photos, pixel-art avatar, and Barry photo are stored under
+`romfs/egg/` as pre-swizzled `.bin` textures. Each file starts with
+an 8-byte little-endian header containing texture and image dimensions,
+followed by the RGBA8 GPU payload in 8x8 Morton/Z-order tiles. The dog
+photos and Barry photo are 400x240 images stored in 512x256 textures;
+the avatar remains a 70x126 image in a 128x128 texture.
 
-Loaded once at startup via `load_easter_egg_images()`, using the exact
-same simple direct-upload pattern as `load_static_icons()` -- no
-runtime file I/O or loader-thread involvement at all, since the data
-is already in the right swizzled format at compile time.
+The files are loaded on demand by `load_easter_egg_images()`, so the
+assets do not cost startup memory or texture uploads until the screen
+is opened.
 
 Deliberately not run through `draw_eye_image()` for display -- that
 function's behaviour branches on `s_dsMode` (widescreen stretch,
@@ -631,19 +672,12 @@ existing button check. The underlying diff-check is unchanged --
 this only widens what counts as "worth checking," not what counts as
 "actually changed."
 
-## Touch-holding "Show Bottom" didn't work
+## Direct bottom-screen peek
 
-Physically holding R is detected via `hidKeysHeld()`, queried fresh
-every frame. Touching and holding the "Show Bottom" footer hint has no
-equivalent: footer-hit consumption is edge-triggered (`kDown`), firing
-once on the initial tap-down -- so the tap correctly played its sound
-(that part is consumed there) but never sustained anything afterward,
-which is exactly why the sound played but the peek itself never
-engaged.
-
-Fixed by separately checking, every frame, whether the touchscreen is
-currently held (`hidKeysHeld() & KEY_TOUCH`) over any footer hitbox
-mapped to `KEY_R` -- R has exactly one meaning anywhere in the app
+In 3DS Mode, holding X displays the selected screenshot's associated
+bottom-screen capture. It works from both the main browse grid and the
+single-item detail view, so opening the More screen is not required.
+DS and GBA modes do not request or display bottom-screen captures.
 (confirmed by checking every use of `ICON_BTN_R`), so this can't be
 ambiguous with anything else. Computed in `ui_frame` (where touch
 coordinates are actually in scope) and read from `draw_bottom_screen`
@@ -741,13 +775,12 @@ entry into the More screen.
 
 ## Startup time: easter egg assets moved to romfs
 
-The easter egg's two dog photos and avatar were baked into
-`assets/easter_egg_data.c` as C arrays -- about **1.06MB living in
-.rodata**, which the 3DS loads into memory at *every* launch, plus
-three texture uploads in `ui_init()` before the app was usable. All
-for a screen most people will never open.
+The easter egg's two dog photos, avatar, and Barry photo are stored as
+pre-swizzled binary assets instead of C arrays. They are loaded only
+when the easter egg is opened, avoiding startup texture uploads and
+resident memory for a screen most people will never open.
 
-They're now pre-swizzled into plain binary files under `romfs/egg/`
+They're pre-swizzled into plain binary files under `romfs/egg/`
 (8-byte header of texW/texH/imgW/imgH, then the swizzled RGBA
 payload), and loaded on first trigger instead of at startup. romfs is
 read on demand rather than loaded wholesale at launch, so this removes

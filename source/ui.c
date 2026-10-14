@@ -5,6 +5,7 @@
 #include "assets/icons_data.h"
 #include "audio.h"
 #include "ds_utils.h"
+#include "gba_utils.h"
 #include <stdarg.h>
 #include <math.h>
 #include <time.h>  // duplicate/import timestamps
@@ -34,10 +35,11 @@ typedef enum {
     APP_RESULT,
     APP_BATCH_CONVERTING,
     APP_BATCH_MERGING,
+    APP_BATCH_ACTION_CONFIRM,
     APP_BATCH_RESULT,         // now doubles as the "copied -- delete originals?" prompt
     APP_BATCH_DELETE_CONFIRM, // standalone batch delete (X), no copy involved
     APP_BATCH_DELETING,       // shared by both the standalone and post-copy delete paths
-    APP_FILTER_MENU,          // All Screenshots / 3D Only / 2D Only / By Date
+    APP_FILTER_MENU,          // 3DS: All/Favorites/Merged/3D/2D/Date; others: All/Favorites/Date
     APP_FILTER_BY_DATE,       // Year / Month / Day rows (Day only shown once Month is specific)
     APP_FILTER_MONTH_PICKER,
     APP_FILTER_YEAR_PICKER,
@@ -58,11 +60,19 @@ typedef enum {
     APP_MERGING,
     APP_EASTER_EGG,
     APP_MODE_SWITCHING,
+    APP_GBA_MOVE_CONFIRM,
+    APP_GBA_MOVING,
+    APP_GBA_BATCH_MOVING,
     // Hidden L+R shortcut from the detail screen -- duplicates the
     // current screenshot, which is mostly a testing convenience.
     APP_DUPLICATE_CONFIRM,
     APP_DUPLICATING,
 } AppState;
+
+typedef enum {
+    BATCH_ACTION_COPY,
+    BATCH_ACTION_MERGE,
+} BatchAction;
 
 static C3D_RenderTarget *s_top, *s_topRight, *s_bot;
 static C2D_TextBuf s_dynBuf;
@@ -80,6 +90,7 @@ static C2D_Font s_fontSemiBold = NULL; // Poppins SemiBold 12 -- header title on
 #define TEXT_10 0.55f
 
 static AppState s_state = APP_BROWSE;
+static int s_modeSwitchTarget = 0; // 0 = 3DS, 1 = DS, 2 = GBA
 
 static ScreenshotPair s_pairs[MAX_PAIRS];
 static int s_pairCount = 0;
@@ -90,6 +101,8 @@ static int s_pairCount = 0;
 // s_pairs directly.
 typedef enum {
     FILTER_ALL,
+    FILTER_FAVORITES,
+    FILTER_MERGED,
     FILTER_3D_ONLY,
     FILTER_2D_ONLY,
     FILTER_BY_DATE,
@@ -113,14 +126,28 @@ static const char *const MONTH_NAMES[12] = {
 // the filter code below runs against whichever mode is active.
 static int  item_count(void);
 static void refresh_ds_availability(void);
+static void refresh_gba_availability(void);
 static const char *item_timestamp(int idx);
 static bool item_has_3d(int idx);
+static bool item_is_merged(int idx);
+static int filter_menu_total(void);
+static FilterMode filter_menu_mode_at(int row);
+static int filter_menu_row_for_mode(FilterMode mode);
 static int  detail_menu_item_count(void);
+static bool gba_item_can_move(int idx);
+static bool move_gba_item(int idx);
+static void migrate_favorite_path(const char *oldPath, const char *newPath);
+static bool item_is_favorite(int idx);
+typedef struct { IconId icon; const char *label; bool disabled; } FooterHint;
+static void draw_footer_hints(const FooterHint *hints, int count);
 
 static bool parse_timestamp_ymd(const char *ts, int *outYear, int *outMonth, int *outDay)
 {
     int y, mo, d, h, mi, s;
-    if (sscanf(ts, "%4d-%2d-%2d_%2d-%2d-%2d", &y, &mo, &d, &h, &mi, &s) < 3) return false;
+    int parsed = sscanf(ts, "%4d-%2d-%2d_%2d-%2d-%2d", &y, &mo, &d, &h, &mi, &s);
+    if (parsed < 3)
+        parsed = sscanf(ts, "%4d_%2d_%2d_%2d_%2d_%2d", &y, &mo, &d, &h, &mi, &s);
+    if (parsed < 3) return false;
     *outYear = y;
     *outMonth = mo;
     *outDay = d;
@@ -131,6 +158,8 @@ static bool pair_matches_filter(int idx)
 {
     switch (s_filterMode) {
     case FILTER_ALL:      return true;
+    case FILTER_FAVORITES: return item_is_favorite(idx);
+    case FILTER_MERGED:   return item_is_merged(idx);
     case FILTER_3D_ONLY:  return item_has_3d(idx);
     case FILTER_2D_ONLY:  return !item_has_3d(idx);
     case FILTER_BY_DATE: {
@@ -241,15 +270,18 @@ static int  s_visibleIndices[MAX_PAIRS];
 static int  s_visibleCount = 0;
 
 // ---- DS mode -----------------------------------------------------
-// Comet runs in one of two modes. They deliberately share nothing but
-// the drawing code: DS screenshots have no stereo pair, no 2D/3D
-// badge, different dimensions, and only an import date rather than a
-// capture date -- so keeping two separate lists is far simpler than
-// making one list carry both shapes.
+// Comet runs in three modes. They deliberately share nothing but
+// the drawing code: DS and GBA screenshots have no stereo pair, no 2D/3D
+// badge, and different dimensions, so keeping separate lists is far
+// simpler than making one list carry all three shapes.
 static bool          s_dsMode = false;
+static bool          s_gbaMode = false;
 static DSScreenshot  s_dsShots[MAX_DS_SHOTS];
 static int           s_dsCount = 0;
-static bool          s_dsAvailable = false;   // any DS content at all? (drives the header hint)
+static bool           s_dsAvailable = false;   // any DS content at all? (drives the header hint)
+static ScreenshotPair s_gbaShots[MAX_PAIRS];
+static int             s_gbaCount = 0;
+static bool            s_gbaAvailable = false;
 static int           s_dsTarCount = 0;        // unextracted screenshots sitting in the tar
 static int           s_dsExtractedThisRun = 0;
 
@@ -260,20 +292,57 @@ static int           s_dsExtractedThisRun = 0;
 // files) that they get entirely separate backing arrays.
 typedef enum { DS_TAB_NDS_BOOTSTRAP, DS_TAB_SD_CARD } DSTab;
 static DSTab     s_dsTab = DS_TAB_SD_CARD; // every open after the first defaults here
+static bool      s_dsTabKeyboardFocus = false;
+static DSTab     s_dsTabFocused = DS_TAB_SD_CARD;
 static DSTarSlot s_dsTarSlots[MAX_DS_TAR_SLOTS];
 static int       s_dsTarSlotCount = 0;
+
+static bool is_3ds_mode(void) { return !s_dsMode && !s_gbaMode; }
+static bool gba_item_can_move(int idx)
+{
+    return s_gbaMode && idx >= 0 && idx < s_gbaCount &&
+           strncmp(s_gbaShots[idx].topPath, SD_ROOT GBA_SCREENSHOTS_LUMA_DIR "/",
+                   strlen(SD_ROOT GBA_SCREENSHOTS_LUMA_DIR) + 1) != 0;
+}
+
+static bool move_gba_item(int idx)
+{
+    if (!gba_item_can_move(idx)) return false;
+
+    const char *src = s_gbaShots[idx].topPath;
+    const char *name = strrchr(src, '/');
+    if (!name || !name[1]) return false;
+
+    char destinationDir[320], destination[360];
+    snprintf(destinationDir, sizeof(destinationDir), "%s%s",
+             SD_ROOT, GBA_SCREENSHOTS_LUMA_DIR);
+    if (!fs_ensure_dir_exists(destinationDir)) return false;
+    snprintf(destination, sizeof(destination), "%s/%s", destinationDir, name + 1);
+
+    struct stat existing;
+    if (stat(destination, &existing) == 0) return false;
+    if (rename(src, destination) != 0) return false;
+    migrate_favorite_path(src, destination);
+    return true;
+}
+static const char *current_mode_label(void)
+{
+    return s_dsMode ? "DS" : s_gbaMode ? "GBA" : "3DS";
+}
 
 // Mode-aware accessors. Everything downstream (thumbnails, preview,
 // filtering, batch ops) goes through these rather than touching
 // s_pairs/s_dsShots/s_dsTarSlots directly.
 static int item_count(void)
 {
+    if (s_gbaMode) return s_gbaCount;
     if (!s_dsMode) return s_pairCount;
     return (s_dsTab == DS_TAB_SD_CARD) ? s_dsCount : s_dsTarSlotCount;
 }
 
 static const char *item_top_path(int idx)
 {
+    if (s_gbaMode) return (idx >= 0 && idx < s_gbaCount) ? s_gbaShots[idx].topPath : NULL;
     if (!s_dsMode) return (idx >= 0 && idx < s_pairCount) ? s_pairs[idx].topPath : NULL;
     if (s_dsTab == DS_TAB_SD_CARD) return (idx >= 0 && idx < s_dsCount) ? s_dsShots[idx].path : NULL;
     // Every nds-bootstrap item lives in the same file, at a different
@@ -292,12 +361,13 @@ static long item_data_offset(int idx)
 
 static const char *item_right_path(int idx)
 {
-    if (s_dsMode) return NULL; // DS captures are single-screen, never stereo
+    if (s_dsMode || s_gbaMode) return NULL; // single-screen modes
     return (idx >= 0 && idx < s_pairCount && s_pairs[idx].has3D) ? s_pairs[idx].topRightPath : NULL;
 }
 
 static const char *item_timestamp(int idx)
 {
+    if (s_gbaMode) return (idx >= 0 && idx < s_gbaCount) ? s_gbaShots[idx].timestamp : "";
     if (!s_dsMode) return (idx >= 0 && idx < s_pairCount) ? s_pairs[idx].timestamp : "";
     if (s_dsTab == DS_TAB_SD_CARD) return (idx >= 0 && idx < s_dsCount) ? s_dsShots[idx].timestamp : "";
     // nds-bootstrap tar entries carry no per-shot date at all (every
@@ -308,8 +378,20 @@ static const char *item_timestamp(int idx)
 
 static bool item_has_3d(int idx)
 {
-    if (s_dsMode) return false;
+    if (s_dsMode || s_gbaMode) return false;
     return (idx >= 0 && idx < s_pairCount) && s_pairs[idx].has3D;
+}
+
+static bool item_has_peekable_bottom(int idx)
+{
+    return is_3ds_mode() && idx >= 0 && idx < s_pairCount &&
+           !s_pairs[idx].isCombined && s_pairs[idx].botPath[0];
+}
+
+static bool item_is_merged(int idx)
+{
+    return !s_dsMode && !s_gbaMode &&
+           idx >= 0 && idx < s_pairCount && s_pairs[idx].isCombined;
 }
 static int  s_selected = 0;
 
@@ -317,9 +399,12 @@ static void rebuild_visible_list(void)
 {
     s_visibleCount = 0;
     int total = item_count();
-    for (int i = 0; i < total; i++) {
-        if (!pair_matches_filter(i)) continue;
-        s_visibleIndices[s_visibleCount++] = i;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < total; i++) {
+            if (!pair_matches_filter(i)) continue;
+            if (item_is_favorite(i) != (pass == 0)) continue;
+            s_visibleIndices[s_visibleCount++] = i;
+        }
     }
     if (s_selected >= s_visibleCount) s_selected = s_visibleCount > 0 ? s_visibleCount - 1 : 0;
     if (s_selected < 0) s_selected = 0;
@@ -355,6 +440,7 @@ static bool s_batchSelected[MAX_PAIRS];
 static int  s_batchTotal = 0;
 static int  s_batchSucceeded = 0;
 static int s_batchSkipped = 0;
+static BatchAction s_batchAction = BATCH_ACTION_COPY;
 static int s_batchIndex = 0;
 
 static int s_flashFrames = 0;
@@ -372,7 +458,7 @@ static char s_lastMessage[256];
 static char s_lastOutputPath[256];
 
 // Single-item detail view.
-static int s_detailMenuSelection = 0; // 0 = Copy to 3DS Album, 1 = Delete
+static int s_detailMenuSelection = 0;
 static int s_confirmSelection = 0;    // 0 = Cancel, 1 = Delete (defaults safe)
 
 static float s_spinnerAngle = 0.0f;
@@ -398,6 +484,108 @@ static int  s_dsWidescreenPathCount = 0;
 #define WIDESCREEN_PREFS_PATH SD_ROOT "/3ds/Comet/widescreen.txt"
 #define DS_INTRO_SEEN_PATH    SD_ROOT "/3ds/Comet/ds_intro_seen.txt"
 #define TAR_WIDESCREEN_PATH   SD_ROOT "/3ds/Comet/widescreen_tar.txt"
+#define FAVORITES_PREFS_PATH  SD_ROOT "/3ds/Comet/favorites.txt"
+
+static char s_favoritePaths[MAX_PAIRS][384];
+static int  s_favoritePathCount = 0;
+
+static bool favorite_path_contains(const char *path)
+{
+    if (!path || !path[0]) return false;
+    for (int i = 0; i < s_favoritePathCount; i++)
+        if (strcmp(s_favoritePaths[i], path) == 0) return true;
+    return false;
+}
+
+static bool favorites_allowed(void)
+{
+    return !s_dsMode || s_dsTab == DS_TAB_SD_CARD;
+}
+
+static bool item_is_favorite(int idx)
+{
+    return favorites_allowed() && favorite_path_contains(item_top_path(idx));
+}
+
+static void load_favorite_prefs(void)
+{
+    s_favoritePathCount = 0;
+    FILE *f = fopen(FAVORITES_PREFS_PATH, "r");
+    if (!f) return;
+
+    char line[384];
+    while (fgets(line, sizeof(line), f) &&
+           s_favoritePathCount < MAX_PAIRS) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0) continue;
+        snprintf(s_favoritePaths[s_favoritePathCount],
+                 sizeof(s_favoritePaths[0]), "%s", line);
+        s_favoritePathCount++;
+    }
+    fclose(f);
+}
+
+static void save_favorite_prefs(void)
+{
+    fs_ensure_dir_exists(SD_ROOT "/3ds/Comet");
+    FILE *f = fopen(FAVORITES_PREFS_PATH, "w");
+    if (!f) return;
+    for (int i = 0; i < s_favoritePathCount; i++)
+        fprintf(f, "%s\n", s_favoritePaths[i]);
+    fclose(f);
+}
+
+static void migrate_favorite_path(const char *oldPath, const char *newPath)
+{
+    for (int i = 0; i < s_favoritePathCount; i++) {
+        if (strcmp(s_favoritePaths[i], oldPath) != 0) continue;
+        snprintf(s_favoritePaths[i], sizeof(s_favoritePaths[i]), "%s", newPath);
+        save_favorite_prefs();
+        return;
+    }
+}
+
+static bool detail_favorites_allowed(int idx)
+{
+    return favorites_allowed() && item_top_path(idx) != NULL;
+}
+
+static int batch_selection_deletable_count(void)
+{
+    int count = 0;
+    int total = item_count();
+    for (int i = 0; i < total; i++) {
+        if (s_batchSelected[i] &&
+            (!favorites_allowed() || !item_is_favorite(i))) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void toggle_favorite(int idx)
+{
+    const char *path = item_top_path(idx);
+    if (!detail_favorites_allowed(idx) || !path) return;
+
+    for (int i = 0; i < s_favoritePathCount; i++) {
+        if (strcmp(s_favoritePaths[i], path) != 0) continue;
+        memmove(&s_favoritePaths[i], &s_favoritePaths[i + 1],
+                (size_t)(s_favoritePathCount - i - 1) * sizeof(s_favoritePaths[0]));
+        s_favoritePathCount--;
+        save_favorite_prefs();
+        return;
+    }
+
+    if (s_favoritePathCount < MAX_PAIRS) {
+        snprintf(s_favoritePaths[s_favoritePathCount],
+                 sizeof(s_favoritePaths[0]), "%s", path);
+        s_favoritePathCount++;
+        save_favorite_prefs();
+    }
+}
 
 // Widescreen marks for tar screenshots are keyed on a content
 // fingerprint, not slot position -- see ds_slot_fingerprint().
@@ -555,8 +743,11 @@ static bool state_has_popup(AppState st)
     case APP_RESULT:
     case APP_DETAIL_DELETE_CONFIRM:
     case APP_DETAIL_DELETING:
+    case APP_GBA_MOVE_CONFIRM:
+    case APP_GBA_MOVING:
     case APP_BATCH_CONVERTING:
     case APP_BATCH_MERGING:
+    case APP_GBA_BATCH_MOVING:
     case APP_BATCH_RESULT:
     case APP_BATCH_DELETE_CONFIRM:
     case APP_BATCH_DELETING:
@@ -836,7 +1027,7 @@ static int loader_request(const char *pathLeft, const char *pathRight)
 // one shared result slot. A poll must NOT throw away a result just
 // because it isn't its own -- it may belong to the other consumer,
 // which hasn't polled yet this frame. Discarding it there is what
-// left the preview (or the R-held bottom capture) spinning forever
+// left the preview (or the X-held bottom capture) spinning forever
 // waiting for a job that had already completed and been destroyed.
 static int s_previewRequestId = 0;
 static int s_bottomCaptureRequestId = 0;
@@ -895,9 +1086,8 @@ static bool current_preview_ready(void)
 static int s_previewRequestedPairIndex = -1;
 
 // The bottom-screen capture Luma also saves (Rosalina's "_bot.bmp"),
-// shown while holding R in the single-item detail view. Loaded once
-// when entering that view (not continuously, unlike the top-screen
-// live preview), reusing the same loader/texture pipeline.
+// shown while holding X in the browse or single-item detail view. Loaded
+// on demand, reusing the same loader/texture pipeline.
 static EyeTexture s_bottomCapture;
 static bool s_bottomCaptureRequested = false;
 
@@ -979,17 +1169,19 @@ static void load_static_icons(void)
     }
 }
 
-// --- easter egg: two dog photos + a pixel-art avatar, shipped inside
+// --- easter egg: dog photos, a pixel-art avatar, and the GBA cat photo,
 // the app itself (romfs/egg/) rather than read from the user's SD
 // card. Pre-swizzled at build time by bake_easter_egg.py.
 typedef enum {
     EASTER_EGG_DOGLEFT,
     EASTER_EGG_DOGRIGHT,
     EASTER_EGG_AVATAR,
+    EASTER_EGG_BARRY,
     EASTER_EGG_IMG_COUNT,
 } EasterEggImageId;
 
 static EyeTexture s_easterEggTex[EASTER_EGG_IMG_COUNT];
+static bool s_gbaEasterEgg = false;
 
 // Loaded from romfs on first use rather than baked into the
 // executable. As a C array in .rodata this was ~1.06MB the 3DS had to
@@ -1007,6 +1199,7 @@ static const char *const kEasterEggFiles[EASTER_EGG_IMG_COUNT] = {
     [EASTER_EGG_DOGLEFT]  = "romfs:/egg/dog_left.bin",
     [EASTER_EGG_DOGRIGHT] = "romfs:/egg/dog_right.bin",
     [EASTER_EGG_AVATAR]   = "romfs:/egg/avatar.bin",
+    [EASTER_EGG_BARRY]    = "romfs:/egg/GBA-Assets.bin",
 };
 
 static void load_easter_egg_images(void)
@@ -1027,7 +1220,7 @@ static void load_easter_egg_images(void)
         if (!C3D_TexInit(&et->tex, texW, texH, GPU_RGBA8)) { fclose(f); continue; }
         C3D_TexSetFilter(&et->tex, GPU_LINEAR, GPU_NEAREST);
         C3D_TexSetWrap(&et->tex, GPU_CLAMP_TO_BORDER, GPU_CLAMP_TO_BORDER);
-        et->tex.border = 0x00000000; // transparent border, matches the avatar's own transparency
+        et->tex.border = 0x00000000; // transparent border for the avatar texture
 
         size_t bytes = (size_t)texW * texH * 4;
         bool ok = fread(et->tex.data, 1, bytes, f) == bytes;
@@ -1253,7 +1446,8 @@ static void build_thumbnail(const char *bmpPath, long base, bool letterbox, Thum
     if (cached) {
         memcpy(rgb, cached, THUMB_RGB_BYTES);
     } else {
-        if (!bmp_load_thumbnail_at(bmpPath, base, THUMB_COLS, THUMB_ROWS, letterbox, rgb, err, sizeof(err))) {
+        if (!bmp_load_thumbnail_at(bmpPath, base, THUMB_COLS, THUMB_ROWS,
+                                   letterbox, rgb, err, sizeof(err))) {
             free_eye_texture(&out->tex);
             return;
         }
@@ -1397,7 +1591,7 @@ static void invalidate_bottom_capture(void)
 // loaded or in flight. Called only when the peek is actually engaged.
 static void maybe_request_bottom_capture(void)
 {
-    if (s_dsMode) return; // DS captures have no companion bottom frame
+    if (!is_3ds_mode()) return; // DS/GBA captures have no companion bottom frame
     if (s_selected < 0 || s_selected >= s_visibleCount) return;
 
     int idx = s_visibleIndices[s_selected];
@@ -1618,8 +1812,6 @@ static void draw_text_semibold(float x, float y, float scale, u32 color, const c
 // margin, each one placed after measuring the previous label. The old
 // version used hardcoded x positions tuned for the (too small) font
 // scale, so at the correct size the labels collided.
-typedef struct { IconId icon; const char *label; bool disabled; } FooterHint;
-
 static const float FOOTER_Y = 213.0f, FOOTER_H = 27.0f;
 
 // Shared by the three By Date screens, which have identical footers.
@@ -1936,14 +2128,18 @@ void ui_init(void)
 
     int n = fs_scan_screenshot_pairs(s_pairs, MAX_PAIRS);
     s_pairCount = (n < 0) ? 0 : n;
-    rebuild_visible_list();
+    s_gbaCount = gba_scan_screenshots(s_gbaShots, MAX_PAIRS);
+    s_gbaAvailable = s_gbaCount > 0;
 
     // Decides whether the L+R "DS Mode" hint shows at all.
     refresh_ds_availability();
+    refresh_gba_availability();
 
     // Seeds s_dsWidescreenPaths from disk, before any DS scan has run.
     load_widescreen_prefs();
     load_tar_widescreen_prefs();
+    load_favorite_prefs();
+    rebuild_visible_list();
 }
 
 void ui_exit(void)
@@ -1965,19 +2161,15 @@ void ui_exit(void)
 
 // ---- state transitions -------------------------------------------------
 
-static void begin_filter_by_date(void); // fwd -- DS mode jumps straight there
+static void begin_filter_by_date(void); // fwd -- shared date-picker entry
 
 static void begin_filter_menu(void)
 {
-    if (s_dsMode) {
-        // Nothing to choose between in DS mode: no stereo variants, so
-        // "By Extraction Date" is the whole filter menu.
-        begin_filter_by_date();
+    if (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP) {
+        // Screenshots.tar has its own archive controls and no filters.
         return;
     }
-    s_filterCursor = (s_filterMode == FILTER_BY_DATE) ? 3
-                    : (s_filterMode == FILTER_2D_ONLY) ? 2
-                    : (s_filterMode == FILTER_3D_ONLY) ? 1 : 0;
+    s_filterCursor = filter_menu_row_for_mode(s_filterMode);
     s_state = APP_FILTER_MENU;
 }
 
@@ -2048,7 +2240,7 @@ static void apply_date_filter_if_ready(void)
 static void enter_detail_view(void)
 {
     if (s_selected < 0 || s_selected >= s_visibleCount) return;
-    s_detailMenuSelection = 0; // default to Copy to 3DS Album
+    s_detailMenuSelection = 0; // default to the first available action
     // Just invalidate -- the actual load is deferred until R is held.
     invalidate_bottom_capture();
     s_state = APP_DETAIL;
@@ -2066,6 +2258,14 @@ static void do_delete_current_pair(void)
     int deletedAt = s_selected; // remember position before the list shrinks
     int deletedItemIdx = (s_selected >= 0 && s_selected < s_visibleCount)
                             ? s_visibleIndices[s_selected] : -1;
+    if (item_is_favorite(deletedItemIdx)) {
+        s_lastSuccess = false;
+        snprintf(s_lastMessage, sizeof(s_lastMessage),
+                 "Favorited screenshots cannot be deleted.");
+        s_lastOutputPath[0] = '\0';
+        op_complete(APP_RESULT);
+        return;
+    }
 
     // Drop this screenshot's cached thumbnail before the list changes,
     // while its path is still resolvable. In-memory only -- the cache
@@ -2085,6 +2285,9 @@ static void do_delete_current_pair(void)
         } else if (idx >= 0 && idx < s_dsCount) {
             ds_delete(&s_dsShots[idx]);
         }
+    } else if (s_gbaMode) {
+        if (deletedItemIdx >= 0 && deletedItemIdx < s_gbaCount)
+            remove(s_gbaShots[deletedItemIdx].topPath);
     } else {
         ScreenshotPair *p = current_pair();
         if (p) fs_delete_pair(p);
@@ -2112,6 +2315,9 @@ static void do_delete_current_pair(void)
         } else {
             ds_rescan_preserving_widescreen();
         }
+    } else if (s_gbaMode) {
+        s_gbaCount = gba_scan_screenshots(s_gbaShots, MAX_PAIRS);
+        s_gbaAvailable = s_gbaCount > 0;
     } else {
         int n = fs_scan_screenshot_pairs(s_pairs, MAX_PAIRS);
         s_pairCount = (n < 0) ? 0 : n;
@@ -2162,7 +2368,10 @@ static void reload_current_mode(void)
     s_batchMode = false;
     memset(s_batchSelected, 0, sizeof(s_batchSelected));
 
-    if (s_dsMode) {
+    if (s_gbaMode) {
+        s_gbaCount = gba_scan_screenshots(s_gbaShots, MAX_PAIRS);
+        s_gbaAvailable = s_gbaCount > 0;
+    } else if (s_dsMode) {
         // Always refresh BOTH libraries, not just the active tab's --
         // the tab bar shows both counts simultaneously, and a stale
         // zero makes the other tab look empty and un-switchable.
@@ -2172,6 +2381,8 @@ static void reload_current_mode(void)
     } else {
         int n = fs_scan_screenshot_pairs(s_pairs, MAX_PAIRS);
         s_pairCount = (n < 0) ? 0 : n;
+        s_gbaCount = gba_scan_screenshots(s_gbaShots, MAX_PAIRS);
+        s_gbaAvailable = s_gbaCount > 0;
     }
 
     // Filters don't carry across modes -- a 3D-only filter is
@@ -2193,9 +2404,16 @@ static void refresh_ds_availability(void)
     s_dsAvailable = anyTar || ds_has_any_extracted();
 }
 
+static void refresh_gba_availability(void)
+{
+    s_gbaCount = gba_scan_screenshots(s_gbaShots, MAX_PAIRS);
+    s_gbaAvailable = s_gbaCount > 0;
+}
+
 static void enter_ds_mode(void)
 {
     s_dsMode = true;
+    s_dsTabKeyboardFocus = false;
 
     // Both are only compared against zero below, so the early-exit
     // checks are enough -- no need to walk all 50 tar slots and the
@@ -2232,8 +2450,30 @@ static void enter_ds_mode(void)
 static void exit_ds_mode(void)
 {
     s_dsMode = false;
+    s_dsTabKeyboardFocus = false;
     reload_current_mode();
     s_state = APP_BROWSE;
+}
+
+static void enter_gba_mode(void)
+{
+    s_gbaMode = true;
+    reload_current_mode();
+    s_state = APP_BROWSE;
+}
+
+static void exit_gba_mode(void)
+{
+    s_gbaMode = false;
+    reload_current_mode();
+    s_state = APP_BROWSE;
+}
+
+static void request_mode_switch(bool right)
+{
+    int current = s_dsMode ? 1 : s_gbaMode ? 2 : 0;
+    s_modeSwitchTarget = right ? (current + 1) % 3 : (current + 2) % 3;
+    op_enter(APP_MODE_SWITCHING);
 }
 
 static void do_ds_extract(void)
@@ -2417,6 +2657,16 @@ static void do_duplicate(void)
                  SD_ROOT, DS_SCREENSHOTS_DIR, stamp, idx);
         ok = copy_file_to(s_dsShots[idx].path, newPath);
         if (ok) ds_rescan_preserving_widescreen();
+    } else if (s_gbaMode) {
+        char gbaStamp[24];
+        time_t now = time(NULL);
+        struct tm *lt = localtime(&now);
+        if (lt) strftime(gbaStamp, sizeof(gbaStamp), "%Y_%m_%d_%H_%M_%S", lt);
+        else    snprintf(gbaStamp, sizeof(gbaStamp), "0000_00_00_00_00_00");
+        snprintf(newPath, sizeof(newPath), "%s%s/%s_dup%02d.bmp",
+                 SD_ROOT, GBA_SCREENSHOTS_DIR, gbaStamp, idx);
+        ok = copy_file_to(s_gbaShots[idx].topPath, newPath);
+        if (ok) reload_current_mode();
     } else {
         ScreenshotPair *p = &s_pairs[idx];
         char dst[320];
@@ -2457,6 +2707,27 @@ static void do_duplicate(void)
         s_thumbSfxMute = 45;
     }
     op_complete(APP_BROWSE);
+}
+
+static void do_gba_move_one(void)
+{
+    int idx = (s_selected >= 0 && s_selected < s_visibleCount)
+                ? s_visibleIndices[s_selected] : -1;
+    bool ok = move_gba_item(idx);
+
+    s_lastSuccess = ok;
+    if (ok) {
+        snprintf(s_lastMessage, sizeof(s_lastMessage), "Screenshot moved to");
+        snprintf(s_lastOutputPath, sizeof(s_lastOutputPath), "%s", GBA_SCREENSHOTS_LUMA_DIR);
+        audio_play(SFX_COPY);
+        s_thumbSfxMute = 45;
+        reload_current_mode();
+    } else {
+        snprintf(s_lastMessage, sizeof(s_lastMessage), "Move failed:");
+        snprintf(s_lastOutputPath, sizeof(s_lastOutputPath), "Destination already contains this filename.");
+    }
+    s_resultReturnState = APP_BROWSE;
+    op_complete(APP_RESULT);
 }
 
 static void begin_convert(void)
@@ -2587,7 +2858,7 @@ static void do_merge_top_bottom(void)
 {
     int idx = (s_selected >= 0 && s_selected < s_visibleCount)
                 ? s_visibleIndices[s_selected] : -1;
-    if (s_dsMode || idx < 0 || idx >= s_pairCount) { s_state = APP_DETAIL; return; }
+    if (!is_3ds_mode() || idx < 0 || idx >= s_pairCount) { s_state = APP_DETAIL; return; }
 
     char err[128] = {0};
     char outPath[320] = "";
@@ -2715,12 +2986,14 @@ static void begin_batch_convert(void)
 
     s_batchSucceeded = 0;
     s_batchIndex = 0;
-    op_enter(APP_BATCH_CONVERTING);
+    s_batchAction = BATCH_ACTION_COPY;
+    s_confirmSelection = 0; // Cancel is the safe default
+    op_enter(APP_BATCH_ACTION_CONFIRM);
 }
 
 static bool batch_item_mergeable(int idx)
 {
-    return !s_dsMode && idx >= 0 && idx < s_pairCount &&
+    return is_3ds_mode() && idx >= 0 && idx < s_pairCount &&
            !s_pairs[idx].isCombined && s_pairs[idx].botPath[0];
 }
 
@@ -2734,11 +3007,54 @@ static void begin_batch_merge(void)
         if (batch_item_mergeable(i)) s_batchTotal++;
         else                        s_batchSkipped++;
     }
+
     if (s_batchTotal == 0) return;
 
     s_batchSucceeded = 0;
     s_batchIndex = 0;
-    op_enter(APP_BATCH_MERGING);
+    s_batchAction = BATCH_ACTION_MERGE;
+    s_confirmSelection = 0; // Cancel is the safe default
+    op_enter(APP_BATCH_ACTION_CONFIRM);
+}
+
+static void begin_batch_move(void)
+{
+    s_batchTotal = 0;
+    int total = item_count();
+    for (int i = 0; i < total; i++) {
+        if (s_batchSelected[i] && gba_item_can_move(i)) s_batchTotal++;
+    }
+    if (s_batchTotal == 0) return;
+
+    s_batchSucceeded = 0;
+    s_batchIndex = 0;
+    op_enter(APP_GBA_BATCH_MOVING);
+}
+
+static void do_batch_move_step(void)
+{
+    int total = item_count();
+    while (s_batchIndex < total &&
+           (!s_batchSelected[s_batchIndex] || !gba_item_can_move(s_batchIndex))) {
+        s_batchIndex++;
+    }
+
+    if (s_batchIndex >= total) {
+        s_lastSuccess = s_batchSucceeded > 0;
+        snprintf(s_lastMessage, sizeof(s_lastMessage), "%d screenshot%s moved to",
+                 s_batchSucceeded, s_batchSucceeded == 1 ? "" : "s");
+        snprintf(s_lastOutputPath, sizeof(s_lastOutputPath), "%s", GBA_SCREENSHOTS_LUMA_DIR);
+        s_batchMode = false;
+        memset(s_batchSelected, 0, sizeof(s_batchSelected));
+        reload_current_mode();
+        audio_play(SFX_COPY);
+        s_thumbSfxMute = 45;
+        op_complete(APP_RESULT);
+        return;
+    }
+
+    if (move_gba_item(s_batchIndex)) s_batchSucceeded++;
+    s_batchIndex++;
 }
 
 static void do_batch_merge_step(void)
@@ -2809,7 +3125,7 @@ static void do_batch_convert_step(void)
         if (isTarTab) {
             snprintf(s_lastMessage, sizeof(s_lastMessage), "%d screenshot%s extracted to",
                      s_batchSucceeded, s_batchSucceeded == 1 ? "" : "s");
-            snprintf(s_lastOutputPath, sizeof(s_lastOutputPath), "/3ds/Comet/ds_screenshots");
+            snprintf(s_lastOutputPath, sizeof(s_lastOutputPath), "%s", DS_SCREENSHOTS_DIR);
             ds_rescan_preserving_widescreen();
             refresh_ds_availability();
         } else {
@@ -2848,7 +3164,8 @@ static void do_batch_convert_step(void)
     char err[128];
     bool haveLeft = false, haveRight = false, ok = false;
 
-    if (srcPath && bmp_load_at(srcPath, item_data_offset(s_batchIndex), &left, err, sizeof(err))) {
+    if (srcPath && bmp_load_at(srcPath, item_data_offset(s_batchIndex),
+                               &left, err, sizeof(err))) {
         haveLeft = true;
         if (rightPath && bmp_load(rightPath, &right, err, sizeof(err))) haveRight = true;
         if (item_is_widescreen(s_batchIndex)) stretch_to_widescreen(&left);
@@ -2874,9 +3191,7 @@ static void do_batch_convert_step(void)
 // Standalone Batch Delete (X), independent of Copy to Album.
 static void begin_batch_delete(void)
 {
-    int count = 0;
-    int total = item_count();
-    for (int i = 0; i < total; i++) if (s_batchSelected[i]) count++;
+    int count = batch_selection_deletable_count();
     if (count == 0) return;
 
     snprintf(s_lastMessage, sizeof(s_lastMessage), "%d screenshot%s will be deleted",
@@ -2895,11 +3210,24 @@ static void begin_batch_delete(void)
 static void do_batch_delete_selected(void)
 {
     int total = item_count();
+    if (batch_selection_deletable_count() == 0) {
+        s_batchMode = false;
+        memset(s_batchSelected, 0, sizeof(s_batchSelected));
+        s_lastSuccess = false;
+        snprintf(s_lastMessage, sizeof(s_lastMessage),
+                 "No selected screenshots can be deleted.");
+        s_lastOutputPath[0] = '\0';
+        op_complete(APP_RESULT);
+        return;
+    }
 
     // Forget cached thumbnails for everything about to go, while the
     // paths still resolve. In-memory only, same as single delete.
     for (int i = 0; i < total; i++) {
-        if (s_batchSelected[i]) thumb_cache_forget(item_top_path(i), item_data_offset(i));
+        if (s_batchSelected[i] &&
+            (!favorites_allowed() || !item_is_favorite(i))) {
+            thumb_cache_forget(item_top_path(i), item_data_offset(i));
+        }
     }
 
     if (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP) {
@@ -2909,12 +3237,17 @@ static void do_batch_delete_selected(void)
         // turn comes -- forwards would delete the wrong slots after
         // the first one.
         for (int i = total - 1; i >= 0; i--) {
-            if (s_batchSelected[i]) ds_delete_tar_slot(i);
+            if (s_batchSelected[i] &&
+                (!favorites_allowed() || !item_is_favorite(i))) {
+                ds_delete_tar_slot(i);
+            }
         }
     } else {
         for (int i = 0; i < total; i++) {
-            if (!s_batchSelected[i]) continue;
+            if (!s_batchSelected[i] ||
+                (favorites_allowed() && item_is_favorite(i))) continue;
             if (s_dsMode) ds_delete(&s_dsShots[i]);
+            else if (s_gbaMode) remove(s_gbaShots[i].topPath);
             else          fs_delete_pair(&s_pairs[i]);
         }
     }
@@ -2930,6 +3263,9 @@ static void do_batch_delete_selected(void)
         } else {
             ds_rescan_preserving_widescreen();
         }
+    } else if (s_gbaMode) {
+        s_gbaCount = gba_scan_screenshots(s_gbaShots, MAX_PAIRS);
+        s_gbaAvailable = s_gbaCount > 0;
     } else {
         int n = fs_scan_screenshot_pairs(s_pairs, MAX_PAIRS);
         s_pairCount = (n < 0) ? 0 : n;
@@ -3080,10 +3416,12 @@ static void draw_top_screen(void)
         gfxSet3D(true);
         C2D_TargetClear(s_top, COLOR_BG);
         C2D_SceneBegin(s_top);
-        draw_easter_egg_eye(&s_easterEggTex[EASTER_EGG_DOGLEFT]);
+        draw_easter_egg_eye(&s_easterEggTex[
+            s_gbaEasterEgg ? EASTER_EGG_BARRY : EASTER_EGG_DOGLEFT]);
         C2D_TargetClear(s_topRight, COLOR_BG);
         C2D_SceneBegin(s_topRight);
-        draw_easter_egg_eye(&s_easterEggTex[EASTER_EGG_DOGRIGHT]);
+        draw_easter_egg_eye(&s_easterEggTex[
+            s_gbaEasterEgg ? EASTER_EGG_BARRY : EASTER_EGG_DOGRIGHT]);
         return;
     case APP_BATCH_CONVERTING:
     case APP_BATCH_MERGING:
@@ -3137,10 +3475,6 @@ static float s_modeToggleX = 0.0f, s_modeToggleW = 0.0f;
 static float s_batchMergeX = 0.0f, s_batchMergeW = 0.0f;
 static bool s_batchMergeVisible = false;
 
-// Set in ui_frame (where touch coordinates are actually accessible),
-// read in draw_bottom_screen's peekingBottomCapture check.
-static bool s_touchHoldingShowBottom = false;
-
 // Triple-tap-the-header-icon-in-1-second easter egg trigger. A ring
 // buffer of the last 3 tap frame-numbers: if all 3 fall within a
 // 60-frame (1 second at 60fps) window, it fires. Sentinel value keeps
@@ -3150,7 +3484,6 @@ static bool s_touchHoldingShowBottom = false;
 static int  s_iconTapFrames[3] = { -100000, -100000, -100000 };
 static int  s_iconTapNext = 0;
 static long s_frameCounter = 0;
-
 // Registers a tap and returns true exactly on the one that completes
 // a triple-tap within the window. Shared by both directions (entering
 // and leaving the easter egg) rather than duplicated, since the
@@ -3187,31 +3520,41 @@ static void draw_header_full(const char *leftLabel, const char *rightLabel,
     if (leftLabel) draw_text_vcenter_semibold(8, 0, HEADER_H, TEXT_9, COLOR_TEXT, leftLabel);
 
     if (showModeToggle && modeLabel) {
-        // [L] + [R] <label>, right-aligned.
+        // The current mode is on the first line. The second line names
+        // the mode selected by each shoulder button.
+        int current = s_dsMode ? 1 : s_gbaMode ? 2 : 0;
+        int leftTarget = (current + 2) % 3;
+        int rightTarget = (current + 1) % 3;
+        static const char *const modeNames[] = { "3DS", "DS", "GBA" };
         float lw = icon_width(ICON_BTN_L), rw = icon_width(ICON_BTN_R);
-        // The "+" never changes, so measure it once rather than
-        // re-parsing a constant every frame. (modeLabel does change --
-        // "DS Mode" vs "3DS Mode" -- so it stays measured per frame.)
-        static float s_plusWidth = -1.0f;
-        if (s_plusWidth < 0.0f) s_plusWidth = measure_text(TEXT_9, "+");
-        float plusW  = s_plusWidth;
-        float labelW = measure_text(TEXT_9, modeLabel);
-        const float g = 3.0f;
-        float total = lw + g + plusW + g + rw + 5.0f + labelW;
+        char leftText[8], rightText[8];
+        snprintf(leftText, sizeof(leftText), "%s", modeNames[leftTarget]);
+        snprintf(rightText, sizeof(rightText), "%s", modeNames[rightTarget]);
+        float switchW = measure_text(TEXT_9, "Switch");
+        float leftW = measure_text(TEXT_9, leftText);
+        float rightW = measure_text(TEXT_9, rightText);
+        const float g = 2.0f;
+        float total = leftW + g + lw + 4.0f + switchW + 4.0f + rw + g + rightW;
         float x = 312.0f - total;
-        float iconY = (HEADER_H - icon_height(ICON_BTN_L)) / 2.0f;
+        const float modeTitleY = 0.0f, modeTitleH = 11.0f;
+        const float switchY = 14.0f, switchH = 11.0f;
+        float iconY = switchY + (switchH - icon_height(ICON_BTN_L)) / 2.0f;
+        float switchX = x + leftW + g + lw + 4.0f;
+        char currentText[32];
+        snprintf(currentText, sizeof(currentText), "%s Mode", modeLabel);
+        float currentW = measure_text(TEXT_9, currentText);
+        draw_text_vcenter(switchX + (switchW - currentW) / 2.0f,
+                          modeTitleY, modeTitleH, TEXT_9, COLOR_TEXT, currentText);
 
-        // Remember where this landed so a tap on it can toggle modes
-        // too -- derived from the same numbers used to draw, so the
-        // touch target always matches what's actually visible.
         s_modeToggleX = x - 4.0f;
         s_modeToggleW = (312.0f - s_modeToggleX) + 4.0f;
         s_modeToggleVisible = true;
 
-        draw_icon(ICON_BTN_L, x, iconY);                       x += lw + g;
-        draw_text_vcenter(x, 0, HEADER_H, TEXT_9, COLOR_TEXT, "+"); x += plusW + g;
-        draw_icon(ICON_BTN_R, x, iconY);                       x += rw + 5.0f;
-        draw_text_vcenter(x, 0, HEADER_H, TEXT_9, COLOR_TEXT, modeLabel);
+        draw_text_vcenter(x, switchY, switchH, TEXT_9, COLOR_TEXT, leftText); x += leftW + g;
+        draw_icon(ICON_BTN_L, x, iconY); x += lw + 4.0f;
+        draw_text_vcenter(x, switchY, switchH, TEXT_9, COLOR_TEXT, "Switch"); x += switchW + 4.0f;
+        draw_icon(ICON_BTN_R, x, iconY); x += rw + g;
+        draw_text_vcenter(x, switchY, switchH, TEXT_9, COLOR_TEXT, rightText);
     } else if (rightLabel) {
         draw_text_right_vcenter(312, 0, HEADER_H, TEXT_9, COLOR_TEXT, rightLabel);
     }
@@ -3236,6 +3579,23 @@ static void draw_batch_merge_hint(bool enabled)
     draw_text_vcenter(x + iw + gap, 0, HEADER_H, TEXT_12, textColor, "Merge");
 }
 
+static void draw_batch_move_hint(bool enabled)
+{
+    s_batchMergeVisible = true;
+    const float gap = 5.0f;
+    float iw = icon_width(ICON_BTN_R);
+    float labelW = measure_text(TEXT_12, "Move");
+    float total = iw + gap + labelW;
+    const float rightEdge = 304.0f;
+    float x = rightEdge - total;
+    u32 textColor = enabled ? COLOR_TEXT : C2D_Color32(0xFD, 0xFD, 0xFD, 0x80);
+
+    s_batchMergeX = x - 4.0f;
+    s_batchMergeW = total + 8.0f;
+    draw_icon_tinted(ICON_BTN_R, x, (HEADER_H - icon_height(ICON_BTN_R)) / 2.0f, !enabled);
+    draw_text_vcenter(x + iw + gap, 0, HEADER_H, TEXT_12, textColor, "Move");
+}
+
 static void draw_header(const char *leftLabel, const char *rightLabel)
 {
     draw_header_full(leftLabel, rightLabel, false, NULL);
@@ -3257,31 +3617,20 @@ static void format_date_ymd(char *buf, size_t bufSize)
     }
 }
 
-// How many screenshots the currently-configured Year/Month/Day would
-// match if applied -- used for the Filter menu's "By Date" row, same
-// spirit as the plain counts shown for All/3D Only/2D Only.
-static int count_matching_by_date(void)
-{
-    if (s_filterYear <= 0) return 0;
-    int count = 0;
-    int total = item_count();
-    for (int i = 0; i < total; i++) {
-        int y, mo, d;
-        if (!parse_timestamp_ymd(item_timestamp(i), &y, &mo, &d)) continue;
-        if (y != s_filterYear) continue;
-        if (s_filterMonth != 0 && mo != s_filterMonth) continue;
-        if (s_filterMonth != 0 && s_filterDay != 0 && d != s_filterDay) continue;
-        count++;
-    }
-    return count;
-}
-
 static const char *filter_mode_label(void)
 {
     static char buf[48];
     switch (s_filterMode) {
     case FILTER_ALL:
-        snprintf(buf, sizeof(buf), s_dsMode ? "DS Screenshots (%d)" : "All Screenshots (%d)", s_visibleCount);
+        snprintf(buf, sizeof(buf), s_dsMode ? "DS Screenshots (%d)"
+                 : s_gbaMode ? "GBA Screenshots (%d)"
+                 : "All Screenshots (%d)", s_visibleCount);
+        return buf;
+    case FILTER_FAVORITES:
+        snprintf(buf, sizeof(buf), "Favorites (%d)", s_visibleCount);
+        return buf;
+    case FILTER_MERGED:
+        snprintf(buf, sizeof(buf), "Merged (%d)", s_visibleCount);
         return buf;
     case FILTER_3D_ONLY:
         snprintf(buf, sizeof(buf), "3D Only (%d)", s_visibleCount);
@@ -3299,51 +3648,61 @@ static const char *filter_mode_label(void)
     return NULL;
 }
 
-// Colours per spec: inactive fill matches page BG, active fill/stroke
-// are new one-off values not shared with anything else in the app
-// (the existing yellow selection colour would visually compete with
-// the tab bar rather than complement it).
+// Tab colours: inactive fill matches page BG, while active tabs use the
+// same white border/text and dark fill as the selected submenu style.
 static u32 tab_inactive_fill(void)  { return COLOR_BG; }
 static u32 tab_inactive_stroke(void){ return C2D_Color32(0x6D, 0x6D, 0x6D, 0xff); }
 static u32 tab_active_fill(void)    { return C2D_Color32(0x1E, 0x1C, 0x16, 0xff); }
-static u32 tab_active_stroke(void)  { return C2D_Color32(0xDD, 0x98, 0x20, 0xff); }
 
-static void draw_ds_tab(float x, const char *label, int count, bool active, bool enabled, IconId glyph, bool glyphOnLeft)
+static void draw_ds_tab(float x, const char *label, int count, bool active,
+                        bool focused, bool enabled, IconId glyph, bool glyphOnLeft)
 {
     u32 fill   = active ? tab_active_fill()   : tab_inactive_fill();
-    u32 stroke = active ? tab_active_stroke() : tab_inactive_stroke();
-    u32 text   = active ? COLOR_TEXT : tab_inactive_stroke(); // spec: inactive text matches its stroke colour
+    u32 stroke = focused ? COLOR_YELLOW
+                         : active ? COLOR_TEXT : tab_inactive_stroke();
+    u32 text   = active ? COLOR_TEXT : tab_inactive_stroke();
     if (!enabled) text = C2D_Color32(0x6D, 0x6D, 0x6D, 0x80); // half-opacity when a tab has nothing in it
 
     draw_rounded_rect(x, TAB_Y, TAB_W, TAB_H, 2, stroke);
     draw_rounded_rect(x + 1, TAB_Y + 1, TAB_W - 2, TAB_H - 2, 2, fill);
 
-    // Shoulder glyph sits against the tab's outer edge -- L on the
-    // left tab, R on the right -- mirroring which button selects it.
+    // The tar badge identifies the left source. The right source has no
+    // shoulder-button glyph because L/R now switch application modes.
     const float pad = 6.0f;
-    float gw = icon_width(glyph);
-    float gx = glyphOnLeft ? (x + pad) : (x + TAB_W - pad - gw);
-    draw_icon_tinted(glyph, gx, TAB_Y + (TAB_H - icon_height(glyph)) / 2.0f, !enabled);
+    bool hasGlyph = glyph < ICON_COUNT;
+    float gw = hasGlyph ? icon_width(glyph) : 0.0f;
+    if (hasGlyph) {
+        float gx = glyphOnLeft ? (x + pad) : (x + TAB_W - pad - gw);
+        if (active) {
+            draw_icon_tinted(glyph, gx, TAB_Y + (TAB_H - icon_height(glyph)) / 2.0f, !enabled);
+        } else {
+            draw_icon_tinted(glyph, gx, TAB_Y + (TAB_H - icon_height(glyph)) / 2.0f, !enabled);
+        }
+    }
 
     // Label centres within whatever's left after the glyph.
-    float textX = glyphOnLeft ? (x + pad + gw) : x;
-    float textW = TAB_W - pad - gw;
+    float textX = hasGlyph && glyphOnLeft ? (x + pad + gw) : x;
+    float textW = hasGlyph && glyphOnLeft ? TAB_W - pad - gw : TAB_W;
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%s (%d)", label, count);
     draw_centered_text(textX, TAB_Y, textW, TAB_H, TEXT_10, text, buf);
 }
 
-// Tab bar: nds-bootstrap on the left, SD Card on the right. Visible
-// throughout DS mode, but only switchable (L/R or touch) from the
+// Tab bar: Screenshots.tar on the left, Extracted on the right. Visible
+// throughout DS mode, but only switchable (D-pad/A or touch) from the
 // unfiltered browse screen -- batch select and detail views show it
 // as context, not a live control.
 static void draw_ds_tabs(void)
 {
-    draw_ds_tab(TAB_LEFT_X,  "nds-bootstrap", s_dsTarSlotCount,
-                s_dsTab == DS_TAB_NDS_BOOTSTRAP, s_dsTarSlotCount > 0, ICON_TAB_L, true);
-    draw_ds_tab(TAB_RIGHT_X, "SD Card", s_dsCount,
-                s_dsTab == DS_TAB_SD_CARD, s_dsCount > 0, ICON_TAB_R, false);
+    draw_ds_tab(TAB_LEFT_X,  "Screenshots.tar", s_dsTarSlotCount,
+                s_dsTab == DS_TAB_NDS_BOOTSTRAP,
+                s_dsTabKeyboardFocus && s_dsTabFocused == DS_TAB_NDS_BOOTSTRAP,
+                s_dsTarSlotCount > 0, ICON_BADGE_DS_TAR_GBA_MOVEABLE, true);
+    draw_ds_tab(TAB_RIGHT_X, "Extracted", s_dsCount,
+                s_dsTab == DS_TAB_SD_CARD,
+                s_dsTabKeyboardFocus && s_dsTabFocused == DS_TAB_SD_CARD,
+                s_dsCount > 0, ICON_BADGE_DS_EXTRACTED, false);
     // Hairline (row-separator style, #797979 inset), not the brighter
     // full-width frame rule used around the header and footer.
     draw_separator(TAB_HAIRLINE_Y);
@@ -3357,7 +3716,7 @@ static void draw_grid(void)
     if (s_batchMode) {
         draw_header("Batch Select", NULL);
         s_batchMergeVisible = false;
-        if (!s_dsMode) {
+        if (is_3ds_mode()) {
             bool anyMergeable = false;
             for (int i = 0; i < item_count(); i++) {
                 if (s_batchSelected[i] && batch_item_mergeable(i)) {
@@ -3366,21 +3725,29 @@ static void draw_grid(void)
                 }
             }
             draw_batch_merge_hint(anyMergeable);
+        } else if (s_gbaMode) {
+            bool anyMoveable = false;
+            for (int i = 0; i < item_count(); i++) {
+                if (s_batchSelected[i] && gba_item_can_move(i)) {
+                    anyMoveable = true;
+                    break;
+                }
+            }
+            draw_batch_move_hint(anyMoveable);
         }
     } else {
         s_batchMergeVisible = false;
-        // The mode toggle only advertises itself when there's actually
-        // something on the other side, and only on the album screen.
         // The SD Card tab supports filtering, so it shows the same
         // "<filter> (count)" label 3DS mode uses. The nds-bootstrap tab
-        // has no filter, so it keeps the plain mode name.
+        // has no filter, so it keeps the plain mode name. The mode
+        // switch is always shown because L+R can enter an empty mode
+        // and the controls should remain discoverable there.
         const char *leftLabel;
-        if (!s_dsMode)                            leftLabel = filter_mode_label();
+        if (!s_dsMode || s_gbaMode)               leftLabel = filter_mode_label();
         else if (s_dsTab == DS_TAB_SD_CARD)       leftLabel = filter_mode_label();
         else                                      leftLabel = "Nintendo DS Mode";
 
-        draw_header_full(leftLabel, NULL,
-                         s_dsAvailable, s_dsMode ? "3DS Mode" : "DS Mode");
+        draw_header_full(leftLabel, NULL, true, current_mode_label());
     }
 
     if (s_dsMode) draw_ds_tabs();
@@ -3388,7 +3755,7 @@ static void draw_grid(void)
     if (s_visibleCount == 0) {
         if (!state_has_popup(s_state)) draw_text(18, GRID_TOP + 6, TEXT_12, COLOR_DIM,
                   item_count() == 0
-                      ? (s_dsMode ? "Nothing here yet."
+                      ? ((s_dsMode || s_gbaMode) ? "Nothing here yet."
                                   : "None yet -- take one from Rosalina.")
                       : "No screenshots match this filter.");
         return;
@@ -3422,12 +3789,13 @@ static void draw_grid(void)
 
             float x = GRID_LEFT + c * (CELL_W + CELL_SPACING_X);
             float y = GRID_TOP + r * (CELL_H + CELL_SPACING_Y);
-            bool sel = (visPos == s_selected);
+            bool sel = (visPos == s_selected) &&
+                       !(s_dsMode && s_dsTabKeyboardFocus);
 
             bool budgetLeft = (builtThisFrame == 0) ||
                               (osGetTime() - thumbStartMs < THUMB_BUDGET_MS);
             if (budgetLeft && !s_thumbs[idx].attempted) {
-                bool wantLetterbox = !s_dsMode && idx < s_pairCount && s_pairs[idx].isCombined;
+                bool wantLetterbox = is_3ds_mode() && idx < s_pairCount && s_pairs[idx].isCombined;
                 build_thumbnail(item_top_path(idx), item_data_offset(idx), wantLetterbox, &s_thumbs[idx]);
                 builtThisFrame++;
                 // Only for the first build of the frame: several can
@@ -3445,19 +3813,38 @@ static void draw_grid(void)
 
             draw_thumbnail(&s_thumbs[idx], x, y, CELL_W, CELL_H);
 
-            // 3D/2D/merged badge, top-left corner of the cell, over
-            // the thumbnail. 3DS mode badges the stereo/flat/combined
-            // distinction; DS mode badges which library the item came
-            // from instead.
-            if (!s_dsMode) {
-                IconId badge = ICON_BADGE_2D;
-                if (item_has_3d(idx))            badge = ICON_BADGE_3D;
-                else if (s_pairs[idx].isCombined) badge = ICON_BADGE_MERGED;
-                draw_icon(badge, x + 2, y + 2);
-            } else {
-                draw_icon(s_dsTab == DS_TAB_NDS_BOOTSTRAP ? ICON_BADGE_DS_TAR
-                                                          : ICON_BADGE_DS_EXTRACTED,
-                          x + 2, y + 2);
+            // Each badge owns a corner, so Favorites can coexist with a
+            // source/type or Peekable badge without obscuring it.
+            if (item_is_favorite(idx)) {
+                draw_icon(ICON_FAVES,
+                          x + CELL_W - icon_width(ICON_FAVES) - 2, y + 2);
+            }
+            if (is_3ds_mode()) {
+                // 3D identifies stereoscopic captures at top-left. The
+                // Peekable badge identifies a separate bottom capture at
+                // bottom-right; ordinary top-only captures have no badge.
+                if (item_has_3d(idx)) {
+                    draw_icon(ICON_BADGE_3D, x + 2, y + 2);
+                }
+                if (item_has_peekable_bottom(idx)) {
+                    draw_icon(ICON_BADGE_PEEKABLE,
+                              x + CELL_W - icon_width(ICON_BADGE_PEEKABLE) - 2,
+                              y + CELL_H - icon_height(ICON_BADGE_PEEKABLE) - 2);
+                }
+            } else if (s_dsMode) {
+                // Screenshots.tar entries retain their source badge at
+                // bottom-left.
+                // Extracted thumbnails intentionally have no SD-card
+                // badge; the tab itself still identifies that source.
+                if (s_dsTab == DS_TAB_NDS_BOOTSTRAP)
+                    draw_icon(ICON_BADGE_DS_TAR_GBA_MOVEABLE, x + 2,
+                              y + CELL_H - icon_height(ICON_BADGE_DS_TAR_GBA_MOVEABLE) - 2);
+            } else if (s_gbaMode && gba_item_can_move(idx)) {
+                // GBA captures in Open_AGB_Firm's source folder have not
+                // yet been moved into Comet's preferred screenshot folder;
+                // show the same source badge at bottom-left.
+                draw_icon(ICON_BADGE_DS_TAR_GBA_MOVEABLE, x + 2,
+                          y + CELL_H - icon_height(ICON_BADGE_DS_TAR_GBA_MOVEABLE) - 2);
             }
 
             if (s_batchMode) {
@@ -3499,7 +3886,10 @@ static const float DETAIL_MENU_TOP = 34, DETAIL_MENU_H = 30, DETAIL_MENU_GAP = 0
 static void format_display_date(const char *ts, char *out, size_t outSize)
 {
     int y, mo, d, h, mi, s;
-    if (sscanf(ts, "%4d-%2d-%2d_%2d-%2d-%2d", &y, &mo, &d, &h, &mi, &s) < 5) {
+    int parsed = sscanf(ts, "%4d-%2d-%2d_%2d-%2d-%2d", &y, &mo, &d, &h, &mi, &s);
+    if (parsed < 5)
+        parsed = sscanf(ts, "%4d_%2d_%2d_%2d_%2d_%2d", &y, &mo, &d, &h, &mi, &s);
+    if (parsed < 5) {
         snprintf(out, outSize, "%s", ts);
         return;
     }
@@ -3514,7 +3904,17 @@ static float detail_menu_item_y(int i) { return DETAIL_MENU_TOP + i * (DETAIL_ME
 // meaning (Copy / Delete).
 static int detail_menu_item_count(void)
 {
-    if (s_dsMode) return (s_dsTab == DS_TAB_NDS_BOOTSTRAP) ? 3 : 2;
+    int idx = s_previewLoadedPairIndex;
+    bool canFavorite = detail_favorites_allowed(idx);
+    bool isFavorite = item_is_favorite(idx);
+    if (s_dsMode) {
+        if (s_dsTab == DS_TAB_NDS_BOOTSTRAP) return 3;
+        return 1 + (canFavorite ? 1 : 0) + (!isFavorite ? 1 : 0);
+    }
+    if (s_gbaMode) {
+        return (gba_item_can_move(idx) ? 1 : 0) +
+               1 + (canFavorite ? 1 : 0) + (!isFavorite ? 1 : 0);
+    }
     // Merge only makes sense when there's a real bottom capture to
     // merge with -- this also rules out offering it on an entry
     // that's already a combined image (a _cmb.bmp-sourced entry has
@@ -3523,10 +3923,10 @@ static int detail_menu_item_count(void)
     //
     // s_previewLoadedPairIndex, not s_selected-derived -- see
     // draw_detail_menu for why.
-    int idx = s_previewLoadedPairIndex;
     bool canMerge = idx >= 0 && idx < s_pairCount &&
                     !s_pairs[idx].isCombined && s_pairs[idx].botPath[0];
-    return canMerge ? 3 : 2; // Copy / [Merge] / Delete
+    return (canMerge ? 1 : 0) +
+           1 + (canFavorite ? 1 : 0) + (!isFavorite ? 1 : 0);
 }
 
 static void draw_detail_menu(void)
@@ -3548,13 +3948,32 @@ static void draw_detail_menu(void)
     draw_header("More Info", dateBuf);
 
     int count = detail_menu_item_count();
-    const char **labels = s_dsMode
-        ? ((count == 3)
-            ? (const char *[]){"Extract Screenshot", "Copy to 3DS Album", "Delete"}
-            : (const char *[]){"Copy to 3DS Album", "Delete"})
-        : ((count == 3)
-            ? (const char *[]){"Copy to 3DS Album", "Merge Top/Bottom Screens", "Delete"}
-            : (const char *[]){"Copy to 3DS Album", "Delete"});
+    bool canFavorite = detail_favorites_allowed(selIdx);
+    bool isFavorite = item_is_favorite(selIdx);
+    const char *labels[4];
+    int labelCount = 0;
+    if (canFavorite)
+        labels[labelCount++] = item_is_favorite(selIdx)
+            ? "Favorites - Remove" : "Favorites - Add";
+    if (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP) {
+        labels[labelCount++] = "Extract Screenshot";
+        labels[labelCount++] = "Copy to 3DS Album";
+        if (!isFavorite) labels[labelCount++] = "Delete";
+    } else if (s_dsMode) {
+        labels[labelCount++] = "Copy to 3DS Album";
+        if (!isFavorite) labels[labelCount++] = "Delete";
+    } else if (s_gbaMode) {
+        labels[labelCount++] = "Copy to 3DS Album";
+        if (gba_item_can_move(selIdx))
+            labels[labelCount++] = "Move to: /luma/screenshots/GBA Screenshots/";
+        if (!isFavorite) labels[labelCount++] = "Delete";
+    } else {
+        labels[labelCount++] = "Copy to 3DS Album";
+        if (selIdx >= 0 && selIdx < s_pairCount &&
+            !s_pairs[selIdx].isCombined && s_pairs[selIdx].botPath[0])
+            labels[labelCount++] = "Merge Top/Bottom Screens";
+        if (!isFavorite) labels[labelCount++] = "Delete";
+    }
 
     for (int i = 0; i < count; i++) {
         float y = detail_menu_item_y(i);
@@ -3637,7 +4056,7 @@ static bool detail_menu_hit_test(int touchX, int touchY, int *outIndex)
 
 static void draw_bottom_capture(void)
 {
-    ScreenshotPair *p = s_dsMode ? NULL : current_pair();
+    ScreenshotPair *p = is_3ds_mode() ? current_pair() : NULL;
     if (s_bottomCapture.valid) {
         float w = 320, h = 240;
         float imgAspect = (float)s_bottomCapture.subtex.width / (float)s_bottomCapture.subtex.height;
@@ -3716,34 +4135,96 @@ static bool list_row_hit_test(int touchY, int start, int total, int *outIndex)
     return false;
 }
 
-static float filter_menu_row_y(int i) { return FILTER_LIST_TOP + (i < 3 ? i * FILTER_ROW_HEIGHT : 3.6f * FILTER_ROW_HEIGHT); }
+static bool filter_menu_has_merged(void)
+{
+    return !s_dsMode && !s_gbaMode;
+}
+
+static int filter_menu_total(void) { return filter_menu_has_merged() ? 6 : 3; }
+
+static FilterMode filter_menu_mode_at(int row)
+{
+    if (row == 0) return FILTER_ALL;
+    if (row == 1) return FILTER_FAVORITES;
+    if (filter_menu_has_merged()) {
+        if (row == 2) return FILTER_MERGED;
+        if (row == 3) return FILTER_3D_ONLY;
+        if (row == 4) return FILTER_2D_ONLY;
+        return FILTER_BY_DATE;
+    }
+    return FILTER_BY_DATE;
+}
+
+static int filter_menu_row_for_mode(FilterMode mode)
+{
+    for (int row = 0; row < filter_menu_total(); row++)
+        if (filter_menu_mode_at(row) == mode) return row;
+    return 0;
+}
+
+static int filter_menu_start(void)
+{
+    int total = filter_menu_total();
+    int start = s_filterCursor >= FILTER_VISIBLE_ROWS
+                   ? s_filterCursor - FILTER_VISIBLE_ROWS + 1 : 0;
+    int maxStart = total - FILTER_VISIBLE_ROWS;
+    if (maxStart < 0) maxStart = 0;
+    return start > maxStart ? maxStart : start;
+}
+
+static float filter_menu_row_y(int i)
+{
+    return FILTER_LIST_TOP + (i - filter_menu_start()) * FILTER_ROW_HEIGHT;
+}
 
 static void draw_filter_menu(void)
 {
     draw_header("Filters", filter_mode_label());
 
-    int countAll = s_pairCount, count3D = 0, count2D = 0;
-    for (int i = 0; i < s_pairCount; i++) { if (s_pairs[i].has3D) count3D++; else count2D++; }
-    (void)count3D; (void)count2D;
-
-    // Counts read as part of the label -- "All Screenshots (88)" --
-    // rather than sitting in a separate right-hand column.
-    char lbl[48];
-    snprintf(lbl, sizeof(lbl), "All Screenshots (%d)", countAll);
-    draw_filter_row(filter_menu_row_y(0), lbl, NULL, true, s_filterMode == FILTER_ALL, s_filterCursor == 0);
-    snprintf(lbl, sizeof(lbl), "3D Only (%d)", count3D);
-    draw_filter_row(filter_menu_row_y(1), lbl, NULL, true, s_filterMode == FILTER_3D_ONLY, s_filterCursor == 1);
-    snprintf(lbl, sizeof(lbl), "2D Only (%d)", count2D);
-    draw_filter_row(filter_menu_row_y(2), lbl, NULL, true, s_filterMode == FILTER_2D_ONLY, s_filterCursor == 2);
-
-    if (s_filterYear > 0) {
-        char dateStr[24], dateBuf[40];
-        format_date_ymd(dateStr, sizeof(dateStr));
-        snprintf(dateBuf, sizeof(dateBuf), "%s (%d)", dateStr, count_matching_by_date());
-        draw_filter_row(filter_menu_row_y(3), "By Date", dateBuf, true, s_filterMode == FILTER_BY_DATE, s_filterCursor == 3);
-    } else {
-        draw_filter_row(filter_menu_row_y(3), "By Date", NULL, true, s_filterMode == FILTER_BY_DATE, s_filterCursor == 3);
+    int countFavorites = 0, countMerged = 0, count3D = 0, count2D = 0;
+    for (int i = 0; i < item_count(); i++) {
+        if (item_is_favorite(i)) countFavorites++;
+        if (item_is_merged(i)) countMerged++;
+        if (item_has_3d(i)) count3D++;
+        else count2D++;
     }
+
+    int start = filter_menu_start();
+    for (int i = start; i < filter_menu_total() &&
+                        i < start + FILTER_VISIBLE_ROWS; i++) {
+        char label[48];
+        switch (filter_menu_mode_at(i)) {
+        case FILTER_ALL:
+            snprintf(label, sizeof(label), "All Screenshots (%d)", item_count());
+            break;
+        case FILTER_FAVORITES:
+            snprintf(label, sizeof(label), "Favorites (%d)", countFavorites);
+            break;
+        case FILTER_MERGED:
+            snprintf(label, sizeof(label), "Merged (%d)", countMerged);
+            break;
+        case FILTER_3D_ONLY:
+            snprintf(label, sizeof(label), "3D Only (%d)", count3D);
+            break;
+        case FILTER_2D_ONLY:
+            snprintf(label, sizeof(label), "2D Only (%d)", count2D);
+            break;
+        case FILTER_BY_DATE:
+            if (s_filterYear > 0) {
+                char dateStr[24];
+                format_date_ymd(dateStr, sizeof(dateStr));
+                snprintf(label, sizeof(label), "By Date (%s)", dateStr);
+            } else {
+                snprintf(label, sizeof(label), "By Date");
+            }
+            break;
+        }
+        draw_filter_row(filter_menu_row_y(i), label, NULL, true,
+                        s_filterMode == filter_menu_mode_at(i),
+                        s_filterCursor == i);
+    }
+    if (filter_menu_total() > FILTER_VISIBLE_ROWS)
+        draw_filter_scrollbar(start, filter_menu_total());
 }
 
 // Must match what draw_by_date_menu() actually renders, or the cursor
@@ -3860,15 +4341,28 @@ static void draw_day_picker(void)
 // s_dsMode/s_pairs/etc at all.
 static void draw_easter_egg_screen(void)
 {
-    char dateBuf[32] = "";
-    // The dog photo's own capture date, not "now" -- this screen is
-    // meant to preserve that specific day, not describe the moment
-    // someone happens to find the egg.
-    format_display_date("2026-08-29_14-10-21.136", dateBuf, sizeof(dateBuf));
-    draw_header(NULL, dateBuf);
+    char dateBuf[64] = "";
+    if (s_gbaEasterEgg) {
+        time_t now = time(NULL);
+        struct tm *nowTm = localtime(&now);
+        if (nowTm) {
+            int h12 = nowTm->tm_hour % 12;
+            if (h12 == 0) h12 = 12;
+            snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d %d:%02d %s",
+                     nowTm->tm_mon + 1, nowTm->tm_mday, nowTm->tm_year + 1900,
+                     h12, nowTm->tm_min, nowTm->tm_hour < 12 ? "a.m." : "p.m.");
+        } else {
+            snprintf(dateBuf, sizeof(dateBuf), "Date unavailable");
+        }
+        draw_header(NULL, dateBuf);
+    } else {
+        // The dog photo's own capture date, not "now".
+        format_display_date("2026-08-29_14-10-21.136", dateBuf, sizeof(dateBuf));
+        draw_header(NULL, dateBuf);
+    }
 
     typedef struct { const char *text; bool semibold; } EggLine;
-    static const EggLine lines[] = {
+    static const EggLine dogLines[] = {
         { "Comet: Observatory of Screenshots", true },
         { "Concept by Pedro Verri", false },
         { "", false },
@@ -3878,7 +4372,20 @@ static void draw_easter_egg_screen(void)
         { "That's my dog, Pudim.", false },
         { "She is the best dog ever!", false },
     };
-    const int lineCount = sizeof(lines) / sizeof(lines[0]);
+    static const EggLine gbaLines[] = {
+        { "Comet: Observatory of Screenshots", true },
+        { "Concept by Pedro Verri", false },
+        { "Fork by LBpartition", false },
+        { "", false },
+        { "Thank you for using Comet!", false },
+        { "We hope you find it useful!", false },
+        { "", false },
+        { "That's my cat, Barry :)", false },
+    };
+    const EggLine *lines = s_gbaEasterEgg ? gbaLines : dogLines;
+    const int lineCount = s_gbaEasterEgg
+        ? (int)(sizeof(gbaLines) / sizeof(gbaLines[0]))
+        : (int)(sizeof(dogLines) / sizeof(dogLines[0]));
     const float textX = 16.0f, textTop = 40.0f, lineH = 18.0f;
 
     for (int i = 0; i < lineCount; i++) {
@@ -3888,10 +4395,10 @@ static void draw_easter_egg_screen(void)
         else                   draw_text(textX, y, TEXT_12, COLOR_TEXT, lines[i].text);
     }
 
-    // Avatar, vertically centred against the text block, right-aligned
-    // with the same margin the text block's left margin mirrors.
+    // The original easter egg includes an avatar. The GBA variant is
+    // intentionally text-only on the bottom screen.
     EyeTexture *avatar = &s_easterEggTex[EASTER_EGG_AVATAR];
-    if (avatar->valid) {
+    if (!s_gbaEasterEgg && avatar->valid) {
         float textBlockH = lineCount * lineH;
         float ax = 320.0f - 16.0f - avatar->subtex.width - 12.0f;
         float ay = textTop + (textBlockH - avatar->subtex.height) / 2.0f + 16.0f;
@@ -3904,15 +4411,18 @@ static void draw_bottom_screen(void)
     C2D_TargetClear(s_bot, COLOR_BG);
     C2D_SceneBegin(s_bot);
 
-    // The bottom-capture peek (holding R in the detail view) fills the
-    // whole 320x240 screen per the mockup, so it skips the footer bar.
+    // The bottom-capture peek (holding X in 3DS browse or detail view)
+    // fills the whole 320x240 screen per the mockup, so it skips the
+    // footer bar.
     // 3DS-only: DS captures never request a bottom-capture load (see
     // request_bottom_capture's !s_dsMode guard), so this used to leave
-    // an unresolvable spinner on screen if R was held in DS mode --
+    // an unresolvable spinner on screen if X was held in DS mode --
     // removed rather than kept as a joke, since a spinner with no
     // outcome reads as a hang, not a wink.
-    bool peekingBottomCapture = !s_dsMode && (s_state == APP_DETAIL) &&
-                                ((hidKeysHeld() & KEY_R) || s_touchHoldingShowBottom);
+    bool peekingBottomCapture = is_3ds_mode() &&
+                                (s_state == APP_DETAIL ||
+                                 (s_state == APP_BROWSE && !s_batchMode)) &&
+                                (hidKeysHeld() & KEY_X);
     if (!peekingBottomCapture) {
         C2D_DrawRectSolid(0, FOOTER_Y, 0, 320, FOOTER_H, COLOR_BG);
         draw_frame_rule(FOOTER_Y);
@@ -3926,15 +4436,24 @@ static void draw_bottom_screen(void)
         break;
     }
     case APP_BROWSE:
+        if (is_3ds_mode() && !s_batchMode && (hidKeysHeld() & KEY_X)) {
+            maybe_request_bottom_capture();
+            poll_bottom_capture();
+        }
+        if (peekingBottomCapture) {
+            draw_bottom_capture();
+            break;
+        }
         draw_grid();
         if (s_batchMode) {
             bool anySelected = false;
             int total = item_count();
             for (int i = 0; i < total; i++) if (s_batchSelected[i]) { anySelected = true; break; }
+            bool deleteBlocked = batch_selection_deletable_count() == 0;
             bool isTarTab = s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP;
             const FooterHint batchHints[] = {
                 { ICON_BTN_A, "OK", false }, { ICON_BTN_B, "Back", false },
-                { ICON_BTN_X, "Delete", !anySelected },
+                { ICON_BTN_X, "Delete", !anySelected || deleteBlocked },
                 { ICON_BTN_L, isTarTab ? "Extract" : "Copy to Album", !anySelected },
             };
             draw_footer_hints(batchHints, 4);
@@ -3949,11 +4468,20 @@ static void draw_bottom_screen(void)
             };
             draw_footer_hints(tarHints, 3);
         } else {
-            static const FooterHint browseHints[] = {
-                { ICON_BTN_A, "More" }, { ICON_BTN_Y, "Filter" },
-                { ICON_BTN_SELECT, "Batch Select" },
-            };
-            draw_footer_hints(browseHints, 3);
+            if (is_3ds_mode()) {
+                static const FooterHint browse3dsHints[] = {
+                    { ICON_BTN_A, "More" }, { ICON_BTN_Y, "Filter" },
+                    { ICON_BTN_SELECT, "Batch Select" },
+                    { ICON_BTN_X, "Peek" },
+                };
+                draw_footer_hints(browse3dsHints, 4);
+            } else {
+                static const FooterHint browseHints[] = {
+                    { ICON_BTN_A, "More" }, { ICON_BTN_Y, "Filter" },
+                    { ICON_BTN_SELECT, "Batch Select" },
+                };
+                draw_footer_hints(browseHints, 3);
+            }
         }
         break;
 
@@ -3971,7 +4499,7 @@ static void draw_bottom_screen(void)
             } else {
                 // Merged screenshots have no separate bottom capture
                 // (the whole image already contains both screens), so
-                // there's nothing for "Show Bottom" to do -- offering
+                // there's nothing for "PEEK" to do -- offering
                 // it there would just be a dead-end option.
                 bool isMerged = s_previewLoadedPairIndex >= 0 &&
                                 s_previewLoadedPairIndex < s_pairCount &&
@@ -3984,7 +4512,7 @@ static void draw_bottom_screen(void)
                 } else {
                     const FooterHint detailHints[] = {
                         { ICON_BTN_A, "OK", false }, { ICON_BTN_B, "Back", false },
-                        { ICON_BTN_R, "Show Bottom", false },
+                        { ICON_BTN_X, "Peek", false },
                     };
                     draw_footer_hints(detailHints, 3);
                 }
@@ -3995,6 +4523,18 @@ static void draw_bottom_screen(void)
     case APP_DETAIL_DELETE_CONFIRM:
         draw_detail_menu();
         draw_confirm_popup("The file will be deleted", NULL, "Cancel", "Delete", s_confirmSelection);
+        break;
+
+    case APP_GBA_MOVE_CONFIRM:
+        draw_detail_menu();
+        draw_confirm_popup3("Move screenshot to", GBA_SCREENSHOTS_LUMA_DIR,
+                            "The legacy copy will be removed.",
+                            "Cancel", "Move", s_confirmSelection);
+        break;
+
+    case APP_GBA_MOVING:
+        draw_detail_menu();
+        draw_popup("Moving...", "Don't remove SD card!", true, false);
         break;
 
     case APP_DETAIL_DELETING:
@@ -4019,6 +4559,26 @@ static void draw_bottom_screen(void)
         draw_popup("Copying...", "Don't remove SD card!", true, false);
         break;
 
+    case APP_BATCH_ACTION_CONFIRM: {
+        const char *action = s_batchAction == BATCH_ACTION_MERGE ? "Merge" :
+                             (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP
+                              ? "Extract" : "Copy");
+        char message[64];
+        snprintf(message, sizeof(message), "%d screenshot%s will be %s",
+                 s_batchTotal, s_batchTotal == 1 ? "" : "s",
+                 s_batchAction == BATCH_ACTION_MERGE ? "merged" :
+                 (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP
+                  ? "extracted" : "copied"));
+        draw_grid();
+        draw_confirm_popup(message, NULL, "Cancel", action, s_confirmSelection);
+        break;
+    }
+
+    case APP_GBA_BATCH_MOVING:
+        draw_grid();
+        draw_popup("Moving...", "Don't remove SD card!", true, false);
+        break;
+
     case APP_BATCH_MERGING:
         draw_grid();
         draw_popup("Merging...", "Don't remove SD card!", true, false);
@@ -4026,7 +4586,8 @@ static void draw_bottom_screen(void)
 
     case APP_BATCH_RESULT:
         draw_grid();
-        draw_confirm_popup(s_lastMessage, s_lastOutputPath, "Back", "Delete", s_confirmSelection);
+        draw_confirm_popup(s_lastMessage, s_lastOutputPath,
+                           "Back", "Delete", s_confirmSelection);
         break;
 
     case APP_BATCH_DELETE_CONFIRM:
@@ -4086,7 +4647,7 @@ static void draw_bottom_screen(void)
 
     case APP_DS_ONE_DELETE_PROMPT:
         draw_detail_menu();
-        draw_confirm_popup3("Screenshot extracted to", "/3ds/Comet/ds_screenshots",
+        draw_confirm_popup3("Screenshot extracted to", DS_SCREENSHOTS_DIR,
                              "Delete from nds-bootstrap?",
                              "Cancel", "Delete", s_confirmSelection);
         break;
@@ -4109,7 +4670,7 @@ static void draw_bottom_screen(void)
 
     case APP_DS_CLEAR_PROMPT:
         draw_grid();
-        draw_confirm_popup3("Screenshots extracted to", "/3ds/Comet/ds_screenshots",
+        draw_confirm_popup3("Screenshots extracted to", DS_SCREENSHOTS_DIR,
                              "Delete from nds-bootstrap?",
                              "Cancel", "Delete", s_confirmSelection);
         break;
@@ -4203,37 +4764,17 @@ bool ui_frame(void)
     // playing a sound, even though they clearly change state.
     bool tappedGoingIntoSwitch = tapped;
 
-    // Touch-hold equivalent of physically holding R, specifically for
-    // "Show Bottom" -- the footer-hit consumption above is edge-
-    // triggered (kDown), firing once on the initial tap-down, so a
-    // sustained hold was never actually detected the way
-    // hidKeysHeld() detects a sustained physical R hold. That's why
-    // the tap sound played correctly (it's consumed above) but the
-    // peek itself never engaged. R has exactly one meaning anywhere
-    // in the app (Show Bottom), so matching any KEY_R-mapped hitbox
-    // is unambiguous.
-    s_touchHoldingShowBottom = false;
-    if (hidKeysHeld() & KEY_TOUCH) {
-        for (int i = 0; i < s_footerHitCount; i++) {
-            FooterHitbox *hb = &s_footerHits[i];
-            if (hb->key == KEY_R && !hb->disabled &&
-                point_in_rect(touch.px, touch.py, hb->x, hb->y, hb->w, hb->h)) {
-                s_touchHoldingShowBottom = true;
-                break;
-            }
-        }
-    }
-
     if (tapped && s_state == APP_BROWSE && s_batchMode && s_batchMergeVisible &&
         point_in_rect(touch.px, touch.py, s_batchMergeX, 0, s_batchMergeW, HEADER_H)) {
-        bool anyMergeable = false;
+        bool anyActionable = false;
         for (int i = 0; i < item_count(); i++) {
-            if (s_batchSelected[i] && batch_item_mergeable(i)) {
-                anyMergeable = true;
+            if (s_batchSelected[i] &&
+                (s_gbaMode ? gba_item_can_move(i) : batch_item_mergeable(i))) {
+                anyActionable = true;
                 break;
             }
         }
-        if (anyMergeable) {
+        if (anyActionable) {
             kDown |= KEY_R;
             tapped = false;
         }
@@ -4277,30 +4818,43 @@ bool ui_frame(void)
     }
 
     case APP_BROWSE:
-        if (kDown & KEY_DOWN) {
-            int next = s_selected + GRID_COLS;
-            int totalRowsNav = (s_visibleCount + GRID_COLS - 1) / GRID_COLS;
-            int currentRowNav = s_selected / GRID_COLS;
-            if (next < s_visibleCount) {
-                s_selected = next;
-            } else if (currentRowNav + 1 < totalRowsNav) {
-                // A row below exists, but it's ragged (fewer items
-                // than a full row) and this column has nothing in it
-                // -- land on the last available item instead of
-                // refusing to move. Without this, columns past
-                // whatever the last row's actual width is were simply
-                // unreachable via Down.
-                s_selected = s_visibleCount - 1;
+        bool dsTabFocus = s_dsMode && !s_batchMode && s_dsTabKeyboardFocus;
+        if (dsTabFocus) {
+            if (kDown & KEY_LEFT) s_dsTabFocused = DS_TAB_NDS_BOOTSTRAP;
+            if (kDown & KEY_RIGHT) s_dsTabFocused = DS_TAB_SD_CARD;
+            if (kDown & KEY_DOWN) s_dsTabKeyboardFocus = false;
+        } else {
+            if (kDown & KEY_DOWN) {
+                int next = s_selected + GRID_COLS;
+                int totalRowsNav = (s_visibleCount + GRID_COLS - 1) / GRID_COLS;
+                int currentRowNav = s_selected / GRID_COLS;
+                if (next < s_visibleCount) {
+                    s_selected = next;
+                } else if (currentRowNav + 1 < totalRowsNav) {
+                    // A row below exists, but it's ragged (fewer items
+                    // than a full row) and this column has nothing in it
+                    // -- land on the last available item instead of
+                    // refusing to move. Without this, columns past
+                    // whatever the last row's actual width is were simply
+                    // unreachable via Down.
+                    s_selected = s_visibleCount - 1;
+                }
+                // else: already in the last row -- no row below at all,
+                // so no move, same as before.
             }
-            // else: already in the last row -- no row below at all,
-            // so no move, same as before.
+            if (kDown & KEY_UP) {
+                if (s_dsMode && !s_batchMode && s_selected < GRID_COLS) {
+                    s_dsTabKeyboardFocus = true;
+                    s_dsTabFocused = s_dsTab;
+                } else {
+                    int next = s_selected - GRID_COLS;
+                    if (next >= 0) s_selected = next;
+                }
+            }
+            if (kDown & KEY_RIGHT && s_selected + 1 < s_visibleCount) s_selected++;
+            if (kDown & KEY_LEFT && s_selected > 0) s_selected--;
+            if (s_selected != selectedBefore) invalidate_bottom_capture();
         }
-        if (kDown & KEY_UP) {
-            int next = s_selected - GRID_COLS;
-            if (next >= 0) s_selected = next;
-        }
-        if (kDown & KEY_RIGHT && s_selected + 1 < s_visibleCount) s_selected++;
-        if (kDown & KEY_LEFT && s_selected > 0) s_selected--;
 
         if (s_batchMode) {
             if (kDown & KEY_A) {
@@ -4322,16 +4876,31 @@ bool ui_frame(void)
             }
             bool anySel = false;
             bool anyMergeable = false;
+            bool anyMoveable = false;
             int selTotal = item_count();
             for (int i = 0; i < selTotal; i++) {
                 if (s_batchSelected[i]) anySel = true;
                 if (s_batchSelected[i] && batch_item_mergeable(i)) anyMergeable = true;
+                if (s_batchSelected[i] && gba_item_can_move(i)) anyMoveable = true;
             }
             if ((kDown & KEY_X) && anySel) begin_batch_delete();
             if ((kDown & KEY_L) && anySel) begin_batch_convert();
-            if ((kDown & KEY_R) && anyMergeable) begin_batch_merge();
+            if ((kDown & KEY_R) && s_gbaMode && anyMoveable) begin_batch_move();
+            else if ((kDown & KEY_R) && anyMergeable) begin_batch_merge();
         } else {
-            if ((kDown & KEY_A) && current_preview_ready()) enter_detail_view();
+            if (dsTabFocus && (kDown & KEY_A)) {
+                DSTab target = s_dsTabFocused;
+                bool targetHasContent = (target == DS_TAB_SD_CARD)
+                                      ? (s_dsCount > 0)
+                                      : (s_dsTarSlotCount > 0);
+                s_dsTabKeyboardFocus = false;
+                if (target != s_dsTab && targetHasContent) {
+                    s_dsTab = target;
+                    reload_current_mode();
+                }
+            } else if ((kDown & KEY_A) && current_preview_ready()) {
+                enter_detail_view();
+            }
             if (tapped) {
                 int visPos;
                 if (grid_hit_test(touch.px, touch.py, &visPos)) {
@@ -4356,16 +4925,9 @@ bool ui_frame(void)
                 s_state = APP_DS_EXTRACT_PROMPT;
             }
 
-            // L+R together switches 3DS/DS libraries. Checked with
-            // keysHeld so the two shoulders don't have to land on the
-            // exact same frame.
-            bool lrCombo = s_dsAvailable && (kDown & (KEY_L | KEY_R)) &&
-                           (hidKeysHeld() & KEY_L) && (hidKeysHeld() & KEY_R);
-
-            // Tapping the header hint does the same thing. Hit-tested
-            // against the rect captured while drawing it, so the touch
-            // target always matches what's actually on screen.
-            bool modeTapped = s_dsAvailable && s_modeToggleVisible && tapped &&
+            // The header is also a touch target. A tap follows the R
+            // direction, matching the right-hand shoulder hint.
+            bool modeTapped = s_modeToggleVisible && tapped &&
                               point_in_rect(touch.px, touch.py,
                                             s_modeToggleX, 0, s_modeToggleW, HEADER_H);
             if (modeTapped) tapped = false; // consumed -- don't also treat it as a grid tap
@@ -4378,6 +4940,7 @@ bool ui_frame(void)
             // separate "reset" logic needed.
             if (tapped && point_in_rect(touch.px, touch.py, 140, 0, 40, HEADER_H)) {
                 if (register_icon_tap_and_check_triple()) {
+                    s_gbaEasterEgg = s_gbaMode;
                     load_easter_egg_images(); // no-op after the first time
                     audio_play(SFX_EASTER_EGG);
                     s_state = APP_EASTER_EGG;
@@ -4385,23 +4948,27 @@ bool ui_frame(void)
                 tapped = false;
             }
 
-            if (lrCombo || modeTapped) {
+            bool leftModeSwitch = (kDown & KEY_L) && !(kDown & KEY_R);
+            bool rightModeSwitch = (kDown & KEY_R) && !(kDown & KEY_L);
+            if (modeTapped) {
+                rightModeSwitch = true;
+                tapped = false;
+            }
+
+            if ((leftModeSwitch || rightModeSwitch) && !s_batchMode) {
                 // Deferred by a frame (op_enter/op_tick) so "Loading..."
                 // actually renders before the blocking scan starts --
                 // otherwise it'd only flash up after the wait it exists
                 // to cover.
-                op_enter(APP_MODE_SWITCHING);
+                request_mode_switch(rightModeSwitch);
             } else if (s_dsMode && !s_batchMode) {
-                // A single L or R switches tabs -- L selects the left
-                // (nds-bootstrap) tab, R the right (SD Card) one,
-                // matching where their glyphs sit on each pill in the
-                // mockup. A tap directly on a tab does the same.
+                // A tap directly on a tab selects it. L/R are reserved
+                // for the regular three-way application mode switch.
                 DSTab target = s_dsTab;
-                if ((kDown & KEY_L) && !(hidKeysHeld() & KEY_R)) target = DS_TAB_NDS_BOOTSTRAP;
-                if ((kDown & KEY_R) && !(hidKeysHeld() & KEY_L)) target = DS_TAB_SD_CARD;
                 if (tapped && touch.py >= TAB_Y && touch.py < TAB_Y + TAB_H) {
                     if (touch.px >= TAB_LEFT_X && touch.px < TAB_LEFT_X + TAB_W) target = DS_TAB_NDS_BOOTSTRAP;
                     else if (touch.px >= TAB_RIGHT_X && touch.px < TAB_RIGHT_X + TAB_W) target = DS_TAB_SD_CARD;
+                    s_dsTabKeyboardFocus = false;
                 }
 
                 bool targetHasContent = (target == DS_TAB_SD_CARD) ? (s_dsCount > 0) : (s_dsTarSlotCount > 0);
@@ -4415,12 +4982,13 @@ bool ui_frame(void)
 
     case APP_DETAIL: {
         u32 held = hidKeysHeld();
-        // "Show bottom" is a 3DS-only peek -- DS captures have no
-        // companion bottom frame, and R there is free for other use.
-        bool rHeld = !s_dsMode && ((held & KEY_R) != 0 || s_touchHoldingShowBottom);
+        // "Show bottom" is a 3DS-only peek -- DS/GBA captures have no
+        // companion bottom frame. X is used so R remains available for
+        // the application mode switch.
+        bool xHeld = is_3ds_mode() && (held & KEY_X) != 0;
         // Load on demand, the first frame the peek is actually engaged
         // -- rather than speculatively on every navigation.
-        if (rHeld) maybe_request_bottom_capture();
+        if (xHeld) maybe_request_bottom_capture();
         poll_bottom_capture();
 
         // Hidden L+R: duplicate this screenshot. Checked before the
@@ -4458,11 +5026,14 @@ bool ui_frame(void)
             break;
         }
 
-        if (!rHeld) {
+        if (!xHeld) {
             int menuCount = detail_menu_item_count();
             if (kDown & KEY_DOWN) s_detailMenuSelection = (s_detailMenuSelection + 1) % menuCount;
             if (kDown & KEY_UP)   s_detailMenuSelection = (s_detailMenuSelection + menuCount - 1) % menuCount;
-            if (kDown & KEY_B) s_state = APP_BROWSE;
+            if (kDown & KEY_B) {
+                rebuild_visible_list();
+                s_state = APP_BROWSE;
+            }
 
             // Left/Right step through the gallery without leaving this
             // screen. Clamped rather than wrapping, matching how the
@@ -4502,36 +5073,58 @@ bool ui_frame(void)
             }
 
             if (chosen >= 0) {
-                if (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP) {
+                int detailIdx = s_previewLoadedPairIndex;
+                bool canFavorite = detail_favorites_allowed(detailIdx);
+                if (canFavorite && chosen == 0) {
+                    toggle_favorite(detailIdx);
+                    s_detailMenuSelection = 0;
+                } else {
+                    int action = chosen - (canFavorite ? 1 : 0);
+                    bool isFavorite = item_is_favorite(detailIdx);
+                    if (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP) {
                     // [0] Extract  [1] Copy  [2] Delete
-                    if (chosen == 0) {
+                    if (action == 0) {
                         s_confirmSelection = 1; // default to Extract
                         s_state = APP_DS_ONE_EXTRACT_PROMPT;
-                    } else if (chosen == 1) {
+                    } else if (action == 1) {
                         begin_convert();
                     } else {
                         s_confirmSelection = 0;
                         s_state = APP_DETAIL_DELETE_CONFIRM;
                     }
-                } else if (s_dsMode) {
+                    } else if (s_dsMode) {
                     // SD Card tab: [0] Copy  [1] Delete
-                    if (chosen == 0) {
+                    if (action == 0) {
                         begin_convert();
-                    } else {
+                    } else if (!isFavorite) {
                         s_confirmSelection = 0;
                         s_state = APP_DETAIL_DELETE_CONFIRM;
                     }
-                } else {
+                    } else if (s_gbaMode) {
+                    // GBA: [0] Copy, optionally [1] Move, [last] Delete.
+                    if (action == 0) {
+                        begin_convert();
+                    } else if (gba_item_can_move(detailIdx) && action == 1) {
+                        s_confirmSelection = 0;
+                        s_state = APP_GBA_MOVE_CONFIRM;
+                    } else if (!isFavorite) {
+                        s_confirmSelection = 0;
+                        s_state = APP_DETAIL_DELETE_CONFIRM;
+                    }
+                    } else {
                     // 3DS: [0] Copy  [1] Delete  -- or, when a real
                     // bottom capture exists, [0] Copy [1] Merge [2] Delete
-                    if (chosen == 0) {
+                    if (action == 0) {
                         begin_convert();
-                    } else if (menuCount == 3 && chosen == 1) {
+                    } else if (detailIdx >= 0 && detailIdx < s_pairCount &&
+                               !s_pairs[detailIdx].isCombined &&
+                               s_pairs[detailIdx].botPath[0] && action == 1) {
                         s_confirmSelection = 0; // default to Cancel
                         s_state = APP_MERGE_CONFIRM;
-                    } else {
+                    } else if (!isFavorite) {
                         s_confirmSelection = 0;
                         s_state = APP_DETAIL_DELETE_CONFIRM;
+                    }
                     }
                 }
             }
@@ -4599,6 +5192,27 @@ bool ui_frame(void)
 
     case APP_DUPLICATING:
         if (op_tick()) do_duplicate();
+        break;
+
+    case APP_GBA_MOVE_CONFIRM: {
+        float cx, cy, cw, ch, dx, dy, dw, dh;
+        popup_button_rect(0, 2, &cx, &cy, &cw, &ch);
+        popup_button_rect(1, 2, &dx, &dy, &dw, &dh);
+        if (kDown & (KEY_LEFT | KEY_RIGHT)) s_confirmSelection ^= 1;
+
+        bool pickedCancel = (kDown & KEY_B) ||
+            ((kDown & KEY_A) && s_confirmSelection == 0) ||
+            (tapped && point_in_rect(touch.px, touch.py, cx, cy, cw, ch));
+        bool pickedMove = ((kDown & KEY_A) && s_confirmSelection == 1) ||
+            (tapped && point_in_rect(touch.px, touch.py, dx, dy, dw, dh));
+
+        if (pickedMove) op_enter(APP_GBA_MOVING);
+        else if (pickedCancel) s_state = APP_DETAIL;
+        break;
+    }
+
+    case APP_GBA_MOVING:
+        if (op_tick()) do_gba_move_one();
         break;
 
     case APP_QUIT_CONFIRM: {
@@ -4706,8 +5320,16 @@ bool ui_frame(void)
         // the intro popup rather than the grid), so nothing further is
         // needed here.
         if (op_tick()) {
-            if (s_dsMode) exit_ds_mode();
-            else          enter_ds_mode();
+            if (s_modeSwitchTarget == 0) {
+                if (s_dsMode) exit_ds_mode();
+                else if (s_gbaMode) exit_gba_mode();
+            } else if (s_modeSwitchTarget == 1) {
+                if (s_gbaMode) exit_gba_mode();
+                if (!s_dsMode) enter_ds_mode();
+            } else {
+                if (s_dsMode) exit_ds_mode();
+                if (!s_gbaMode) enter_gba_mode();
+            }
         }
         break;
 
@@ -4766,9 +5388,43 @@ bool ui_frame(void)
         else if (s_opFrames >= OP_MIN_FRAMES) s_state = s_opNextState;
         break;
 
+    case APP_BATCH_ACTION_CONFIRM: {
+        if (kDown & (KEY_LEFT | KEY_RIGHT)) s_confirmSelection = !s_confirmSelection;
+        if (kDown & KEY_B) s_state = APP_BROWSE;
+        if (kDown & KEY_A) {
+            if (s_confirmSelection == 0) {
+                s_state = APP_BROWSE;
+            } else if (s_batchAction == BATCH_ACTION_MERGE) {
+                op_enter(APP_BATCH_MERGING);
+            } else {
+                op_enter(APP_BATCH_CONVERTING);
+            }
+        }
+        if (tapped) {
+            float cx, cy, cw, ch, dx, dy, dw, dh;
+            popup_button_rect(0, 2, &cx, &cy, &cw, &ch);
+            popup_button_rect(1, 2, &dx, &dy, &dw, &dh);
+            if (point_in_rect(touch.px, touch.py, cx, cy, cw, ch)) {
+                s_state = APP_BROWSE;
+            } else if (point_in_rect(touch.px, touch.py, dx, dy, dw, dh)) {
+                if (s_batchAction == BATCH_ACTION_MERGE)
+                    op_enter(APP_BATCH_MERGING);
+                else
+                    op_enter(APP_BATCH_CONVERTING);
+            }
+        }
+        break;
+    }
+
     case APP_BATCH_MERGING:
         s_opFrames++;
         if (!s_opDone) do_batch_merge_step();
+        else if (s_opFrames >= OP_MIN_FRAMES) s_state = s_opNextState;
+        break;
+
+    case APP_GBA_BATCH_MOVING:
+        s_opFrames++;
+        if (!s_opDone) do_batch_move_step();
         else if (s_opFrames >= OP_MIN_FRAMES) s_state = s_opNextState;
         break;
 
@@ -4818,24 +5474,28 @@ bool ui_frame(void)
         break;
 
     case APP_FILTER_MENU: {
-        if (kDown & KEY_DOWN && s_filterCursor < 3) s_filterCursor++;
+        if (kDown & KEY_DOWN && s_filterCursor < filter_menu_total() - 1) s_filterCursor++;
         if (kDown & KEY_UP && s_filterCursor > 0) s_filterCursor--;
         if (kDown & KEY_B) s_state = APP_BROWSE;
 
         int activated = -1;
         if (kDown & KEY_A) activated = s_filterCursor;
         if (tapped) {
-            for (int i = 0; i < 4; i++) {
+            int start = filter_menu_start();
+            for (int i = start; i < filter_menu_total() &&
+                                i < start + FILTER_VISIBLE_ROWS; i++) {
                 float y = filter_menu_row_y(i);
                 if (touch.py >= y && touch.py < y + FILTER_ROW_HEIGHT) { activated = i; s_filterCursor = i; break; }
             }
         }
-        if (activated == 0 || activated == 1 || activated == 2) {
-            s_filterMode = activated == 0 ? FILTER_ALL : activated == 1 ? FILTER_3D_ONLY : FILTER_2D_ONLY;
+        if (activated >= 0 && activated < filter_menu_total() &&
+            filter_menu_mode_at(activated) != FILTER_BY_DATE) {
+            s_filterMode = filter_menu_mode_at(activated);
             rebuild_visible_list();
             s_flashFrames = 3;
             s_state = APP_BROWSE;
-        } else if (activated == 3) {
+        } else if (activated >= 0 &&
+                   filter_menu_mode_at(activated) == FILTER_BY_DATE) {
             begin_filter_by_date();
         }
         break;
@@ -4848,8 +5508,13 @@ bool ui_frame(void)
         if (kDown & KEY_DOWN && s_filterCursor < rowCount - 1) s_filterCursor++;
         if (kDown & KEY_UP && s_filterCursor > 0) s_filterCursor--;
         if (kDown & KEY_B) {
-            if (s_dsMode) { s_state = APP_BROWSE; }
-            else { s_filterCursor = 3; s_state = APP_FILTER_MENU; }
+            if (s_dsMode && s_dsTab == DS_TAB_NDS_BOOTSTRAP) {
+                s_state = APP_BROWSE;
+            }
+            else {
+                s_filterCursor = filter_menu_row_for_mode(FILTER_BY_DATE);
+                s_state = APP_FILTER_MENU;
+            }
         }
         if (kDown & KEY_A) {
             if (s_filterCursor == 0) begin_year_picker();
