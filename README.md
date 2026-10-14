@@ -11,7 +11,7 @@ New features and changes:
    - Hold X to peek at images directly from the thumbnail selection screen
  
 * Changes: DS Mode:
-   - DS .tar screenshots are extracted to `/luma/screenshots/GBA Screenshots/`
+   - DS .tar screenshots are extracted to `/luma/screenshots/DS Screenshots/`
    - Added functional filters to NDS Mode's Extracted section
    - Use Dpad to switch between Screenshots.tar & Extracted tabs
  
